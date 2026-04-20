@@ -1,4 +1,6 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import json
 import logging
 import pytz
@@ -401,7 +403,11 @@ def main():
     if not token:
         raise ValueError("Установи переменную окружения TELEGRAM_BOT_TOKEN")
 
-    app = Application.builder().token(token).build()
+    proxy_url = os.environ.get("PROXY_URL")
+    builder = Application.builder().token(token)
+    if proxy_url:
+        builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+    app = builder.build()
 
     conv_handler = ConversationHandler(
         entry_points=[

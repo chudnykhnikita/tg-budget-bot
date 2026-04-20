@@ -1,4 +1,5 @@
+.env
 venv/
-budget_data.json
 __pycache__/
 *.pyc
+budget_data.json
