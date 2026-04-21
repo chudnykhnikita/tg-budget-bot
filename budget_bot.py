@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 ENTERING_AMOUNT, ENTERING_CATEGORY = range(2)
 EDIT_CHOOSE_FIELD, EDIT_ENTERING_VALUE = range(2, 4)
 
-DATA_FILE = "budget_data.json"
+DATA_FILE = os.environ.get("DATA_FILE", "/data/budget_data.json")
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -435,7 +435,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_value))
 
     print("Бот запущен...")
-    app.run_polling(close_loop=False)
+    app.run_polling(
+        close_loop=False,
+        timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
 
 
 if __name__ == "__main__":
