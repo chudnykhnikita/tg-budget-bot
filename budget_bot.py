@@ -13,11 +13,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-warnings.filterwarnings("ignore", category=PTBUserWarning)
-
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import NetworkError, TimedOut
 from telegram.warnings import PTBUserWarning
+
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 from telegram.ext import (
     Application,
     CommandHandler,
