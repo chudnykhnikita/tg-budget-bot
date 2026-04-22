@@ -1,11 +1,17 @@
 import os
-from dotenv import load_dotenv
-load_dotenv()
 import json
 import logging
-import pytz
+import asyncio
+import tempfile
+import uuid
 from datetime import datetime
 from io import BytesIO
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -19,38 +25,83 @@ from telegram.ext import (
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# Состояния
+# --- Состояния ---
 ENTERING_AMOUNT, ENTERING_CATEGORY = range(2)
-EDIT_CHOOSE_FIELD, EDIT_ENTERING_VALUE = range(2, 4)
+EDIT_LIST, EDIT_CHOOSE_FIELD, EDIT_ENTERING_VALUE = range(2, 5)
 
+# --- Константы ---
 DATA_FILE = os.environ.get("DATA_FILE", "/data/budget_data.json")
-MOSCOW_TZ = pytz.timezone("Europe/Moscow")
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+MAX_CATEGORY_LEN = 64
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["➕ Поступление", "➖ Списание"], ["💰 Баланс", "📥 Скачать файл"]],
+    [
+        ["➕ Поступление", "➖ Списание"],
+        ["💰 Баланс", "🕓 История"],
+        ["✏️ Изменить", "📥 Скачать файл"],
+    ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
+# --- Блокировка для безопасной записи ---
+_lock = asyncio.Lock()
+
+
+# --- Работа с данными ---
 
 def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
+    if not os.path.exists(DATA_FILE):
+        return {"transactions": []}
+    try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"transactions": []}
+    except json.JSONDecodeError:
+        logger.exception("Corrupted %s, backing up", DATA_FILE)
+        os.rename(DATA_FILE, DATA_FILE + ".corrupt")
+        return {"transactions": []}
 
 
-def save_data(data: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+async def save_data(data: dict):
+    async with _lock:
+        dir_ = os.path.dirname(DATA_FILE) or "."
+        os.makedirs(dir_, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".budget_", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, DATA_FILE)
+        except Exception:
+            os.unlink(tmp)
+            raise
 
 
-def get_user_txs(user_id):
-    data = load_data()
-    return [(i, t) for i, t in enumerate(data["transactions"]) if t["user_id"] == user_id]
+def parse_amount(s: str) -> Decimal:
+    try:
+        v = Decimal(s.strip().replace(",", ".")).quantize(Decimal("0.01"), ROUND_HALF_UP)
+    except InvalidOperation:
+        raise ValueError
+    if v <= 0:
+        raise ValueError
+    return v
+
+
+def fmt(amount) -> str:
+    return f"{Decimal(str(amount)):.2f}"
+
+
+# --- Error handler ---
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled error", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text("⚠️ Что-то пошло не так, попробуй ещё раз.")
 
 
 # --- Основные хендлеры ---
@@ -59,16 +110,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот для ведения бюджета.\n\n"
         "Используй кнопки внизу.\n\n"
-        "/history — последние 10 операций\n"
-        "/edit — редактировать или удалить операцию\n"
         "/export — выгрузить в Excel\n"
         "/clear — очистить все данные",
         reply_markup=MAIN_KEYBOARD,
     )
+    return ConversationHandler.END
 
 
 async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    text = update.message.text or ""
 
     if "Поступление" in text:
         context.user_data["type"] = "income"
@@ -81,6 +131,11 @@ async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif "Баланс" in text:
         await show_summary(update, context)
         return ConversationHandler.END
+    elif "История" in text:
+        await history(update, context)
+        return ConversationHandler.END
+    elif "Изменить" in text:
+        return await edit_start(update, context)
     elif "Скачать файл" in text:
         await export_excel(update, context)
         return ConversationHandler.END
@@ -89,53 +144,57 @@ async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", ".")
+    text = update.message.text or ""
 
-    if any(k in text for k in ["Поступление", "Списание", "Баланс", "Скачать файл"]):
+    if any(k in text for k in ["Поступление", "Списание", "Баланс", "История", "Изменить", "Скачать файл"]):
         return await handle_main_buttons(update, context)
 
+    t_type = context.user_data.get("type")
+    if t_type not in ("income", "expense"):
+        await update.message.reply_text("Начни заново с кнопок.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
     try:
-        amount = float(text)
-        if amount <= 0:
-            raise ValueError
+        amount = parse_amount(text)
     except ValueError:
         await update.message.reply_text("❌ Введи корректную сумму (например: 1500 или 99.90)")
         return ENTERING_AMOUNT
 
-    context.user_data["amount"] = amount
-    context.user_data["date"] = update.message.date.astimezone(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    context.user_data["amount"] = str(amount)
 
-    if context.user_data["type"] == "expense":
+    if t_type == "expense":
         await update.message.reply_text("📝 На что потратил? Напиши категорию или описание:")
         return ENTERING_CATEGORY
     else:
-        _save_transaction(update.effective_user.id, amount, "income", None, context.user_data["date"])
-        await update.message.reply_text(f"✅ Поступление {amount:.2f} ₽ сохранено!", reply_markup=MAIN_KEYBOARD)
+        await _save_transaction(update.effective_user.id, amount, "income", None)
+        await update.message.reply_text(f"✅ Поступление {fmt(amount)} ₽ сохранено!", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
 
 async def enter_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    category = update.message.text.strip()
-    amount = context.user_data["amount"]
-    _save_transaction(update.effective_user.id, amount, "expense", category, context.user_data["date"])
-    await update.message.reply_text(f"✅ Списание {amount:.2f} ₽ ({category}) сохранено!", reply_markup=MAIN_KEYBOARD)
+    category = (update.message.text or "").strip()[:MAX_CATEGORY_LEN]
+    amount = Decimal(context.user_data["amount"])
+    await _save_transaction(update.effective_user.id, amount, "expense", category)
+    await update.message.reply_text(f"✅ Списание {fmt(amount)} ₽ ({category}) сохранено!", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
 
-def _save_transaction(user_id, amount, t_type, category, date):
-    data = load_data()
+async def _save_transaction(user_id: int, amount: Decimal, t_type: str, category):
+    now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    data = await asyncio.to_thread(load_data)
     data["transactions"].append({
+        "id": str(uuid.uuid4()),
         "user_id": user_id,
         "type": t_type,
-        "amount": amount,
+        "amount": str(amount),
         "category": category,
-        "date": date,
+        "date": now,
     })
-    save_data(data)
+    await save_data(data)
 
 
 async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
+    data = await asyncio.to_thread(load_data)
     user_id = update.effective_user.id
     txs = [t for t in data["transactions"] if t["user_id"] == user_id]
 
@@ -143,27 +202,27 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
         return
 
-    total_income = sum(t["amount"] for t in txs if t["type"] == "income")
-    total_expense = sum(t["amount"] for t in txs if t["type"] == "expense")
+    total_income = sum(Decimal(t["amount"]) for t in txs if t["type"] == "income")
+    total_expense = sum(Decimal(t["amount"]) for t in txs if t["type"] == "expense")
     balance = total_income - total_expense
 
-    categories: dict[str, float] = {}
+    categories: dict[str, Decimal] = {}
     for t in txs:
         if t["type"] == "expense" and t["category"]:
-            categories[t["category"]] = categories.get(t["category"], 0) + t["amount"]
+            categories[t["category"]] = categories.get(t["category"], Decimal("0")) + Decimal(t["amount"])
 
     cat_lines = ""
     if categories:
         sorted_cats = sorted(categories.items(), key=lambda x: -x[1])
         cat_lines = "\n\n📊 Расходы по категориям:\n" + "\n".join(
-            f"  • {cat}: {amt:.2f} ₽" for cat, amt in sorted_cats
+            f"  • {cat}: {fmt(amt)} ₽" for cat, amt in sorted_cats
         )
 
     emoji = "✅" if balance >= 0 else "⚠️"
     await update.message.reply_text(
-        f"📈 Поступления: {total_income:.2f} ₽\n"
-        f"📉 Списания:    {total_expense:.2f} ₽\n"
-        f"{emoji} Баланс:    {balance:.2f} ₽{cat_lines}",
+        f"📈 Поступления: {fmt(total_income)} ₽\n"
+        f"📉 Списания:    {fmt(total_expense)} ₽\n"
+        f"{emoji} Баланс:    {fmt(balance)} ₽{cat_lines}",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -172,28 +231,29 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_txs = get_user_txs(user_id)
+    data = await asyncio.to_thread(load_data)
+    user_txs = [t for t in data["transactions"] if t["user_id"] == user_id]
 
     if not user_txs:
         await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
-        return
+        return ConversationHandler.END
 
-    # Показываем последние 20 операций
     recent = user_txs[-20:][::-1]
     buttons = []
-    for idx, (global_i, t) in enumerate(recent):
+    for t in recent:
         if t["type"] == "income":
-            label = f"➕ {t['amount']:.0f}₽  {t['date']}"
+            label = f"➕ {fmt(t['amount'])}₽  {t['date']}"
         else:
             cat = f" · {t['category']}" if t["category"] else ""
-            label = f"➖ {t['amount']:.0f}₽{cat}  {t['date']}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"sel:{global_i}")])
+            label = f"➖ {fmt(t['amount'])}₽{cat}  {t['date']}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"sel:{t['id']}")])
 
     buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel")])
     await update.message.reply_text(
-        "Выбери операцию для редактирования или удаления:",
+        "Выбери операцию:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+    return EDIT_LIST
 
 
 async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -202,15 +262,20 @@ async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "edit_cancel":
         await query.edit_message_text("❌ Отменено.")
-        return
+        return ConversationHandler.END
 
-    global_i = int(query.data.split(":")[1])
-    data = load_data()
-    t = data["transactions"][global_i]
-    context.user_data["edit_index"] = global_i
+    tx_id = query.data.split(":", 1)[1]
+    data = await asyncio.to_thread(load_data)
+    t = next((x for x in data["transactions"] if x["id"] == tx_id), None)
+
+    if t is None or t["user_id"] != update.effective_user.id:
+        await query.edit_message_text("⛔ Операция недоступна.")
+        return ConversationHandler.END
+
+    context.user_data["edit_tx_id"] = tx_id
 
     if t["type"] == "income":
-        desc = f"➕ Поступление {t['amount']:.2f} ₽\n📅 {t['date']}"
+        desc = f"➕ Поступление {fmt(t['amount'])} ₽\n📅 {t['date']}"
         buttons = [
             [InlineKeyboardButton("✏️ Изменить сумму", callback_data="edit_field:amount")],
             [InlineKeyboardButton("🗑 Удалить", callback_data="edit_delete")],
@@ -218,7 +283,7 @@ async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     else:
         cat = t.get("category") or "—"
-        desc = f"➖ Списание {t['amount']:.2f} ₽\n📝 {cat}\n📅 {t['date']}"
+        desc = f"➖ Списание {fmt(t['amount'])} ₽\n📝 {cat}\n📅 {t['date']}"
         buttons = [
             [InlineKeyboardButton("✏️ Изменить сумму", callback_data="edit_field:amount")],
             [InlineKeyboardButton("✏️ Изменить описание", callback_data="edit_field:category")],
@@ -227,6 +292,7 @@ async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
 
     await query.edit_message_text(desc, reply_markup=InlineKeyboardMarkup(buttons))
+    return EDIT_CHOOSE_FIELD
 
 
 async def edit_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,30 +300,34 @@ async def edit_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "edit_back":
-        # Перерисовываем список
         user_id = update.effective_user.id
-        user_txs = get_user_txs(user_id)
+        data = await asyncio.to_thread(load_data)
+        user_txs = [t for t in data["transactions"] if t["user_id"] == user_id]
         recent = user_txs[-20:][::-1]
         buttons = []
-        for global_i, t in recent:
+        for t in recent:
             if t["type"] == "income":
-                label = f"➕ {t['amount']:.0f}₽  {t['date']}"
+                label = f"➕ {fmt(t['amount'])}₽  {t['date']}"
             else:
                 cat = f" · {t['category']}" if t["category"] else ""
-                label = f"➖ {t['amount']:.0f}₽{cat}  {t['date']}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"sel:{global_i}")])
+                label = f"➖ {fmt(t['amount'])}₽{cat}  {t['date']}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"sel:{t['id']}")])
         buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel")])
         await query.edit_message_text("Выбери операцию:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
+        return EDIT_LIST
 
     if query.data == "edit_delete":
-        global_i = context.user_data.get("edit_index")
-        data = load_data()
-        deleted = data["transactions"].pop(global_i)
-        save_data(data)
-        t_type = "Поступление" if deleted["type"] == "income" else "Списание"
-        await query.edit_message_text(f"🗑 {t_type} {deleted['amount']:.2f} ₽ удалено.")
-        return
+        tx_id = context.user_data.get("edit_tx_id")
+        data = await asyncio.to_thread(load_data)
+        t = next((x for x in data["transactions"] if x["id"] == tx_id), None)
+        if t is None or t["user_id"] != update.effective_user.id:
+            await query.edit_message_text("⛔ Операция недоступна.")
+            return ConversationHandler.END
+        data["transactions"] = [x for x in data["transactions"] if x["id"] != tx_id]
+        await save_data(data)
+        t_type = "Поступление" if t["type"] == "income" else "Списание"
+        await query.edit_message_text(f"🗑 {t_type} {fmt(t['amount'])} ₽ удалено.")
+        return ConversationHandler.END
 
     if query.data.startswith("edit_field:"):
         field = query.data.split(":")[1]
@@ -266,43 +336,66 @@ async def edit_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Введи новую сумму:")
         else:
             await query.edit_message_text("Введи новое описание:")
-        context.user_data["awaiting_edit"] = True
+        return EDIT_ENTERING_VALUE
+
+    return EDIT_CHOOSE_FIELD
 
 
 async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_edit"):
-        return
-
     field = context.user_data.get("edit_field")
-    global_i = context.user_data.get("edit_index")
-    text = update.message.text.strip()
+    tx_id = context.user_data.get("edit_tx_id")
+    text = (update.message.text or "").strip()
 
-    data = load_data()
-    t = data["transactions"][global_i]
+    data = await asyncio.to_thread(load_data)
+    t = next((x for x in data["transactions"] if x["id"] == tx_id), None)
+    if t is None or t["user_id"] != update.effective_user.id:
+        await update.message.reply_text("⛔ Операция недоступна.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
 
     if field == "amount":
         try:
-            new_val = float(text.replace(",", "."))
-            if new_val <= 0:
-                raise ValueError
+            new_val = parse_amount(text)
         except ValueError:
-            await update.message.reply_text("❌ Введи корректную сумму:", reply_markup=MAIN_KEYBOARD)
-            return
-        t["amount"] = new_val
-        msg = f"✅ Сумма обновлена: {new_val:.2f} ₽"
+            await update.message.reply_text("❌ Введи корректную сумму:")
+            return EDIT_ENTERING_VALUE
+        t["amount"] = str(new_val)
+        msg = f"✅ Сумма обновлена: {fmt(new_val)} ₽"
     else:
-        t["category"] = text
-        msg = f"✅ Описание обновлено: {text}"
+        t["category"] = text[:MAX_CATEGORY_LEN]
+        msg = f"✅ Описание обновлено: {t['category']}"
 
-    save_data(data)
-    context.user_data["awaiting_edit"] = False
+    await save_data(data)
     await update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+# --- /clear с подтверждением ---
+
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑 Да, удалить всё", callback_data="clear_yes"),
+        InlineKeyboardButton("Отмена", callback_data="clear_no"),
+    ]])
+    await update.message.reply_text("Точно удалить ВСЕ свои операции? Это действие необратимо.", reply_markup=kb)
+
+
+async def clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "clear_yes":
+        data = await asyncio.to_thread(load_data)
+        user_id = update.effective_user.id
+        data["transactions"] = [t for t in data["transactions"] if t["user_id"] != user_id]
+        await save_data(data)
+        await query.edit_message_text("🗑 Все твои данные удалены.")
+    else:
+        await query.edit_message_text("Отменено.")
 
 
 # --- Экспорт ---
 
 async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
+    data = await asyncio.to_thread(load_data)
     user_id = update.effective_user.id
     txs = [t for t in data["transactions"] if t["user_id"] == user_id]
 
@@ -327,7 +420,7 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     style_header(ws_income["B1"], income_fill)
     income_txs = [t for t in txs if t["type"] == "income"]
     for t in income_txs:
-        ws_income.append([t["date"], t["amount"]])
+        ws_income.append([t["date"], float(t["amount"])])
     if income_txs:
         r = len(income_txs) + 2
         ws_income[f"A{r}"] = "Итого"
@@ -344,7 +437,7 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     style_header(ws_expense["C1"], expense_fill)
     expense_txs = [t for t in txs if t["type"] == "expense"]
     for t in expense_txs:
-        ws_expense.append([t["date"], t["amount"], t.get("category", "")])
+        ws_expense.append([t["date"], float(t["amount"]), t.get("category", "")])
     if expense_txs:
         r = len(expense_txs) + 2
         ws_expense[f"A{r}"] = "Итого"
@@ -362,8 +455,10 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=buf, filename=f"budget_{now}.xlsx", caption="📊 Готово!")
 
 
+# --- История ---
+
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
+    data = await asyncio.to_thread(load_data)
     user_id = update.effective_user.id
     txs = [t for t in data["transactions"] if t["user_id"] == user_id]
 
@@ -374,24 +469,15 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for t in txs[-10:][::-1]:
         if t["type"] == "income":
-            lines.append(f"➕ +{t['amount']:.2f} ₽  [{t['date']}]")
+            lines.append(f"➕ +{fmt(t['amount'])} ₽  [{t['date']}]")
         else:
             cat = f" ({t['category']})" if t["category"] else ""
-            lines.append(f"➖ -{t['amount']:.2f} ₽{cat}  [{t['date']}]")
+            lines.append(f"➖ -{fmt(t['amount'])} ₽{cat}  [{t['date']}]")
 
     await update.message.reply_text("🕓 Последние операции:\n\n" + "\n".join(lines), reply_markup=MAIN_KEYBOARD)
 
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user_id = update.effective_user.id
-    data["transactions"] = [t for t in data["transactions"] if t["user_id"] != user_id]
-    save_data(data)
-    await update.message.reply_text("🗑 Все твои данные удалены.", reply_markup=MAIN_KEYBOARD)
-
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["awaiting_edit"] = False
     await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -409,34 +495,50 @@ def main():
         builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
     app = builder.build()
 
-    conv_handler = ConversationHandler(
+    app.add_error_handler(on_error)
+
+    # Conversation: добавление операций
+    add_conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^(➕ Поступление|➖ Списание|💰 Баланс|📥 Скачать файл)$"), handle_main_buttons)
+            MessageHandler(
+                filters.Regex("^(➕ Поступление|➖ Списание|💰 Баланс|🕓 История|✏️ Изменить|📥 Скачать файл)$"),
+                handle_main_buttons,
+            )
         ],
         states={
             ENTERING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_amount)],
             ENTERING_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_category)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+        ],
+    )
+
+    # Conversation: редактирование
+    edit_conv = ConversationHandler(
+        entry_points=[CommandHandler("edit", edit_start)],
+        states={
+            EDIT_LIST: [CallbackQueryHandler(edit_select, pattern="^(sel:|edit_cancel)")],
+            EDIT_CHOOSE_FIELD: [CallbackQueryHandler(edit_action, pattern="^(edit_field:|edit_delete|edit_back|edit_cancel)")],
+            EDIT_ENTERING_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_value)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+        ],
     )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("export", export_excel))
-    app.add_handler(CommandHandler("edit", edit_start))
     app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(clear_confirm, pattern="^clear_"))
+    app.add_handler(add_conv)
+    app.add_handler(edit_conv)
 
-    # Inline кнопки для редактирования
-    app.add_handler(CallbackQueryHandler(edit_select, pattern="^sel:"))
-    app.add_handler(CallbackQueryHandler(edit_action, pattern="^(edit_field:|edit_delete|edit_back|edit_cancel)"))
-
-    # Ввод нового значения при редактировании
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_value))
-
-    print("Бот запущен...")
+    logger.info("Bot started")
     app.run_polling(
-        close_loop=False,
         timeout=30,
         read_timeout=30,
         write_timeout=30,

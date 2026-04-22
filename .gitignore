@@ -3,3 +3,6 @@ venv/
 __pycache__/
 *.pyc
 budget_data.json
+*.corrupt
+.DS_Store
+.idea/
