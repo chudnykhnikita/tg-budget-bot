@@ -4,6 +4,7 @@ import logging
 import asyncio
 import tempfile
 import uuid
+import warnings
 from datetime import datetime
 from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -12,7 +13,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+warnings.filterwarnings("ignore", category=PTBUserWarning)
+
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import NetworkError, TimedOut
+from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -78,7 +83,10 @@ async def save_data(data: dict):
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, DATA_FILE)
         except Exception:
-            os.unlink(tmp)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
             raise
 
 
@@ -99,7 +107,11 @@ def fmt(amount) -> str:
 # --- Error handler ---
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled error", exc_info=context.error)
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning("Transient network error: %s", err)
+        return
+    logger.exception("Unhandled error", exc_info=err)
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text("⚠️ Что-то пошло не так, попробуй ещё раз.")
 
@@ -166,7 +178,12 @@ async def enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📝 На что потратил? Напиши категорию или описание:")
         return ENTERING_CATEGORY
     else:
-        await _save_transaction(update.effective_user.id, amount, "income", None)
+        try:
+            await _save_transaction(update.effective_user.id, amount, "income", None)
+        except OSError:
+            logger.exception("Failed to save transaction")
+            await update.message.reply_text("⚠️ Не удалось сохранить операцию, данные НЕ записаны.", reply_markup=MAIN_KEYBOARD)
+            return ConversationHandler.END
         await update.message.reply_text(f"✅ Поступление {fmt(amount)} ₽ сохранено!", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
@@ -174,7 +191,12 @@ async def enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def enter_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category = (update.message.text or "").strip()[:MAX_CATEGORY_LEN]
     amount = Decimal(context.user_data["amount"])
-    await _save_transaction(update.effective_user.id, amount, "expense", category)
+    try:
+        await _save_transaction(update.effective_user.id, amount, "expense", category)
+    except OSError:
+        logger.exception("Failed to save transaction")
+        await update.message.reply_text("⚠️ Не удалось сохранить операцию, данные НЕ записаны.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
     await update.message.reply_text(f"✅ Списание {fmt(amount)} ₽ ({category}) сохранено!", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -490,7 +512,14 @@ def main():
         raise ValueError("Установи переменную окружения TELEGRAM_BOT_TOKEN")
 
     proxy_url = os.environ.get("PROXY_URL")
-    builder = Application.builder().token(token)
+    builder = (
+        Application.builder()
+        .token(token)
+        .get_updates_read_timeout(25)
+        .get_updates_write_timeout(25)
+        .get_updates_connect_timeout(10)
+        .get_updates_pool_timeout(25)
+    )
     if proxy_url:
         builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
     app = builder.build()
@@ -538,13 +567,7 @@ def main():
     app.add_handler(edit_conv)
 
     logger.info("Bot started")
-    app.run_polling(
-        timeout=30,
-        read_timeout=30,
-        write_timeout=30,
-        connect_timeout=30,
-        pool_timeout=30,
-    )
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

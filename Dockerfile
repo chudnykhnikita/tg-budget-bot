@@ -7,8 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY budget_bot.py .
 
-RUN useradd -m -u 10001 bot && mkdir -p /data && chown bot:bot /data
-USER bot
+RUN mkdir -p /data
 
 VOLUME ["/data"]
 
