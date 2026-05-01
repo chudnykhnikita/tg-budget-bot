@@ -41,15 +41,16 @@ logger = logging.getLogger(__name__)
 # Состояния диалога
 # ---------------------------------------------------------------------------
 (
-    ST_CHOOSE_ACCOUNT,      # выбор счёта: Наличные / Карта
-    ST_CHOOSE_DIRECTION,    # выбор: Поступление / Списание
-    ST_ENTERING_AMOUNT,     # ввод суммы
-    ST_CHOOSE_CATEGORY,     # выбор категории кнопками (или свободный ввод)
-    ST_ENTERING_NOTE,       # ввод примечания 2-го уровня
-    ST_ENTERING_ZP_DATE,    # ввод даты для ЗП упаковщиков
-) = range(6)
+    ST_CHOOSE_ACCOUNT,          # выбор счёта: Наличные / Карта
+    ST_CHOOSE_DIRECTION,        # выбор: Поступление / Списание
+    ST_ENTERING_AMOUNT,         # ввод суммы
+    ST_CHOOSE_CATEGORY,         # выбор категории кнопками (или свободный ввод)
+    ST_ENTERING_NOTE,           # ввод примечания 2-го уровня
+    ST_ENTERING_ZP_DATE,        # ввод даты для ЗП упаковщиков
+    ST_ENTERING_REQUEST_AMOUNT, # ввод суммы запроса
+) = range(7)
 
-EDIT_LIST, EDIT_CHOOSE_FIELD, EDIT_ENTERING_VALUE = range(6, 9)
+EDIT_LIST, EDIT_CHOOSE_FIELD, EDIT_ENTERING_VALUE = range(7, 10)
 
 # ---------------------------------------------------------------------------
 # Константы
@@ -89,7 +90,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["💵 Наличные", "💳 Карта"],
         ["💰 Баланс",   "🕓 История"],
-        ["✏️ Изменить", "📥 Скачать файл"],
+        ["✏️ Изменить", "📨 Запросил"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -103,14 +104,17 @@ _lock = asyncio.Lock()
 
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
-        return {"transactions": []}
+        return {"transactions": [], "requests": []}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except json.JSONDecodeError:
         logger.exception("Corrupted %s, backing up", DATA_FILE)
         os.rename(DATA_FILE, DATA_FILE + ".corrupt")
-        return {"transactions": []}
+        return {"transactions": [], "requests": []}
+    data.setdefault("transactions", [])
+    data.setdefault("requests", [])
+    return data
 
 
 async def save_data(data: dict):
@@ -143,6 +147,18 @@ async def _save_transaction(user_id: int, amount: Decimal, t_type: str,
         "category": category,
         "note":     note,
         "date":     now,
+    })
+    await save_data(data)
+
+
+async def _save_request(user_id: int, amount: Decimal):
+    now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    data = await asyncio.to_thread(load_data)
+    data["requests"].append({
+        "id":      str(uuid.uuid4()),
+        "user_id": user_id,
+        "amount":  str(amount),
+        "date":    now,
     })
     await save_data(data)
 
@@ -225,9 +241,14 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     if "Изменить" in text:
         return await edit_start(update, context)
-    if "Скачать файл" in text:
-        await export_excel(update, context)
-        return ConversationHandler.END
+    if "Запросил" in text:
+        await update.message.reply_text(
+            "Введи запрошенную сумму:",
+            reply_markup=ReplyKeyboardMarkup(
+                [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+            ),
+        )
+        return ST_ENTERING_REQUEST_AMOUNT
 
     if "Наличные" in text:
         context.user_data["account"] = "cash"
@@ -458,6 +479,52 @@ async def _finish(update: Update, context: ContextTypes.DEFAULT_TYPE,
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
+# Запрос денег («Запросил»)
+# ---------------------------------------------------------------------------
+
+async def handle_request_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if BTN_CANCEL in text:
+        return await cancel(update, context)
+
+    try:
+        amount = parse_amount(text)
+    except ValueError:
+        await update.message.reply_text("❌ Введи корректную сумму (например: 100000 или 99.90)")
+        return ST_ENTERING_REQUEST_AMOUNT
+
+    user_id = update.effective_user.id
+    try:
+        await _save_request(user_id, amount)
+    except OSError:
+        logger.exception("Failed to save request")
+        await update.message.reply_text(
+            "⚠️ Не удалось сохранить запрос, попробуй ещё раз.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    # Показываем сводку: сколько всего запрошено, сколько уже пришло, сколько осталось
+    data    = await asyncio.to_thread(load_data)
+    txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
+    reqs    = [r for r in data["requests"]     if r["user_id"] == user_id]
+    total_req     = sum(Decimal(r["amount"]) for r in reqs)
+    total_card_in = sum(
+        Decimal(t["amount"]) for t in txs
+        if t.get("account") == "card" and t["type"] == "income"
+    )
+    remaining = total_req - total_card_in
+
+    await update.message.reply_text(
+        f"✅ Запрошено {fmt(amount)} ₽\n\n"
+        f"📨 Всего запрошено:  {fmt(total_req)} ₽\n"
+        f"💳 Получено по карте: {fmt(total_card_in)} ₽\n"
+        f"⏳ Осталось получить: {fmt(remaining)} ₽",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    return ConversationHandler.END
+
+# ---------------------------------------------------------------------------
 # Баланс
 # ---------------------------------------------------------------------------
 
@@ -465,8 +532,9 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = await asyncio.to_thread(load_data)
     user_id = update.effective_user.id
     txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
+    reqs    = [r for r in data["requests"]     if r["user_id"] == user_id]
 
-    if not txs:
+    if not txs and not reqs:
         await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
         return
 
@@ -480,6 +548,18 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cash_bal = cash_inc - cash_exp
     card_bal = card_inc - card_exp
     total    = cash_bal + card_bal
+
+    # Запросы: сколько запрошено и сколько ещё не пришло (минус поступления на карту)
+    total_req = sum(Decimal(r["amount"]) for r in reqs)
+    remaining = total_req - card_inc
+    req_lines = ""
+    if reqs:
+        req_lines = (
+            "\n\n📨 Запросы\n"
+            f"  Запрошено:        {fmt(total_req)} ₽\n"
+            f"  Получено (карта): {fmt(card_inc)} ₽\n"
+            f"  Осталось:         {fmt(remaining)} ₽"
+        )
 
     # Расходы по категориям (карта)
     categories: dict[str, Decimal] = {}
@@ -507,6 +587,7 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Списания:    {fmt(card_exp)} ₽\n"
         f"  Баланс:      {fmt(card_bal)} ₽\n\n"
         f"{'✅' if total >= 0 else '⚠️'} Общий баланс: {fmt(total)} ₽"
+        f"{req_lines}"
         f"{cat_lines}"
     )
 
@@ -554,15 +635,16 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ---------------------------------------------------------------------------
-# Экспорт Excel (4 листа: Наличные поступления, Наличные списания, Карта поступления, Карта списания)
+# Экспорт Excel (5 листов: Наличные поступления/списания, Карта поступления/списания, Запросы)
 # ---------------------------------------------------------------------------
 
 async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = await asyncio.to_thread(load_data)
     user_id = update.effective_user.id
     txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
+    reqs    = [r for r in data["requests"]     if r["user_id"] == user_id]
 
-    if not txs:
+    if not txs and not reqs:
         await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
         return
 
@@ -570,6 +652,7 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header_font    = Font(name="Arial", bold=True, color="FFFFFF")
     income_fill    = PatternFill("solid", start_color="1E7E34")
     expense_fill   = PatternFill("solid", start_color="C0392B")
+    request_fill   = PatternFill("solid", start_color="2980B9")
 
     def style_header(cell, fill):
         cell.font      = header_font
@@ -619,6 +702,30 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = [[t["date"], float(t["amount"]), t.get("category") or "", t.get("note") or ""]
             for t in txs if t.get("account") == "card" and t["type"] == "expense"]
     build_sheet(ws4, rows, ["Дата", "Сумма (₽)", "Категория", "Примечание"], expense_fill, has_note=True)
+
+    # Лист 5: Запросы (запрошено, получено по карте, осталось получить)
+    ws5 = wb.create_sheet("Запросы")
+    req_rows = [[r["date"], float(r["amount"])] for r in reqs]
+    build_sheet(ws5, req_rows, ["Дата", "Запрошено (₽)"], request_fill)
+
+    total_card_in = sum(
+        Decimal(t["amount"]) for t in txs
+        if t.get("account") == "card" and t["type"] == "income"
+    )
+    if req_rows:
+        # Строка "Итого" уже добавлена build_sheet'ом на len(req_rows)+2
+        total_r = len(req_rows) + 2
+        rec_r   = total_r + 2
+        rem_r   = total_r + 3
+        ws5[f"A{rec_r}"] = "Получено по карте"
+        ws5[f"A{rec_r}"].font = Font(name="Arial", bold=True)
+        ws5[f"B{rec_r}"] = float(total_card_in)
+        ws5[f"B{rec_r}"].font = Font(name="Arial", bold=True)
+        ws5[f"A{rem_r}"] = "Осталось получить"
+        ws5[f"A{rem_r}"].font = Font(name="Arial", bold=True)
+        ws5[f"B{rem_r}"] = f"=B{total_r}-B{rec_r}"
+        ws5[f"B{rem_r}"].font = Font(name="Arial", bold=True)
+        ws5.column_dimensions["A"].width = 22
 
     buf = BytesIO()
     wb.save(buf)
@@ -787,6 +894,7 @@ async def clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data    = await asyncio.to_thread(load_data)
         user_id = update.effective_user.id
         data["transactions"] = [t for t in data["transactions"] if t["user_id"] != user_id]
+        data["requests"]     = [r for r in data["requests"]     if r["user_id"] != user_id]
         await save_data(data)
         await query.edit_message_text("🗑 Все твои данные удалены.")
     else:
@@ -823,17 +931,18 @@ def main():
     app.add_error_handler(on_error)
 
     main_filter = filters.Regex(
-        "^(💵 Наличные|💳 Карта|💰 Баланс|🕓 История|✏️ Изменить|📥 Скачать файл)$"
+        "^(💵 Наличные|💳 Карта|💰 Баланс|🕓 История|✏️ Изменить|📨 Запросил)$"
     )
 
     add_conv = ConversationHandler(
         entry_points=[MessageHandler(main_filter, handle_account)],
         states={
-            ST_CHOOSE_DIRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direction)],
-            ST_ENTERING_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount)],
-            ST_CHOOSE_CATEGORY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category)],
-            ST_ENTERING_ZP_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_zp_date)],
-            ST_ENTERING_NOTE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note)],
+            ST_CHOOSE_DIRECTION:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direction)],
+            ST_ENTERING_AMOUNT:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount)],
+            ST_CHOOSE_CATEGORY:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category)],
+            ST_ENTERING_ZP_DATE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_zp_date)],
+            ST_ENTERING_NOTE:           [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note)],
+            ST_ENTERING_REQUEST_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_request_amount)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
