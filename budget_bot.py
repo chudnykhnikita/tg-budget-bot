@@ -59,25 +59,31 @@ DATA_FILE       = os.environ.get("DATA_FILE", "/data/budget_data.json")
 MOSCOW_TZ       = ZoneInfo("Europe/Moscow")
 MAX_NOTE_LEN    = 128
 
+# Категории (константы — используются и как лейблы кнопок, и как ключи).
+CAT_BANK  = "🏦 Плата банку"
+CAT_ZP    = "👷 ЗП упаковщиков"
+CAT_DIV   = "💎 Дивиденды"
+CAT_MEAL  = "🍽 Обеды"
+CAT_OFC   = "🏢 Офис"
+CAT_WH    = "📦 Склад"
+
+CAT_SALE  = "🛒 Продажа со склада"
+
+SUB_BANK_SERVICE = "🧾 Обслуживание счёта"
+SUB_BANK_FEE     = "💸 Комиссия"
+
 # Категории карты — списания
-CARD_EXPENSE_CATEGORIES = [
-    "Плата банку",
-    "ЗП упаковщиков",
-    "Дивиденды",
-    "Обеды",
-    "Офис",
-    "Склад",
-]
+CARD_EXPENSE_CATEGORIES = [CAT_BANK, CAT_ZP, CAT_DIV, CAT_MEAL, CAT_OFC, CAT_WH]
 # Подкатегории «Плата банку»
-BANK_SUBCATEGORIES = ["Обслуживание счёта", "Комиссия"]
-# Подкатегории «Дивиденды»
+BANK_SUBCATEGORIES = [SUB_BANK_SERVICE, SUB_BANK_FEE]
+# Подкатегории «Дивиденды» (имена без эмодзи)
 DIVIDEND_SUBCATEGORIES = ["Андрей", "Алексей", "Никита"]
 
 # Категории наличных — поступления (кнопки + свободный ввод)
-CASH_INCOME_CATEGORIES = ["Продажа со склада"]
+CASH_INCOME_CATEGORIES = [CAT_SALE]
 
 # Категории наличных — списания (кнопки + свободный ввод)
-CASH_EXPENSE_CATEGORIES = ["ЗП упаковщиков"]
+CASH_EXPENSE_CATEGORIES = [CAT_ZP]
 
 BTN_FREE   = "✏️ Свой вариант"
 BTN_TODAY  = "📅 Сегодня"
@@ -191,8 +197,11 @@ def _kb(rows: list[list[str]], prefix: str = "") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def _reply_kb(options: list[str], add_free: bool = False, add_today: bool = False) -> ReplyKeyboardMarkup:
-    rows = [[opt] for opt in options]
+def _reply_kb(options: list[str], add_free: bool = False, add_today: bool = False,
+              cols: int = 2) -> ReplyKeyboardMarkup:
+    # Раскладываем варианты сеткой по `cols` колонок (по умолчанию 2),
+    # как основная клавиатура.
+    rows = [options[i:i + cols] for i in range(0, len(options), cols)]
     if add_today:
         rows.append([BTN_TODAY])
     if add_free:
@@ -360,14 +369,14 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Карта — списание: подкатегории
     if account == "card" and direction == "expense":
-        if text == "Плата банку":
+        if text == CAT_BANK:
             context.user_data["category"] = text
             kb = _reply_kb(BANK_SUBCATEGORIES)
             await update.message.reply_text("Уточни:", reply_markup=kb)
             context.user_data["awaiting_subcategory"] = True
             return ST_CHOOSE_CATEGORY
 
-        if text == "Дивиденды":
+        if text == CAT_DIV:
             context.user_data["category"] = text
             kb = _reply_kb(DIVIDEND_SUBCATEGORIES)
             await update.message.reply_text("Кому?", reply_markup=kb)
@@ -380,14 +389,14 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   category=context.user_data["category"],
                                   note=context.user_data["note"])
 
-        if text == "ЗП упаковщиков":
+        if text == CAT_ZP:
             context.user_data["category"] = text
             kb = _reply_kb([], add_today=True)
             await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
             context.user_data["awaiting_zp_date"] = True
             return ST_ENTERING_ZP_DATE
 
-        if text in ("Офис", "Склад"):
+        if text in (CAT_OFC, CAT_WH):
             context.user_data["category"] = text
             await update.message.reply_text(
                 "Добавь пояснение (или /skip чтобы пропустить):",
@@ -395,7 +404,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ST_ENTERING_NOTE
 
-        if text == "Обеды":
+        if text == CAT_MEAL:
             return await _finish(update, context, category=text, note=None)
 
         if text in CARD_EXPENSE_CATEGORIES:
@@ -403,7 +412,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await _finish(update, context, category=text, note=None)
 
     # Наличные — ЗП упаковщиков
-    if text == "ЗП упаковщиков":
+    if text == CAT_ZP:
         context.user_data["category"] = text
         kb = _reply_kb([], add_today=True)
         await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
