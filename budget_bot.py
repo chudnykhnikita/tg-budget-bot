@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import asyncio
@@ -195,6 +196,27 @@ def fmt(amount) -> str:
     Для Excel НЕ используется — там значения идут как float напрямую."""
     d = Decimal(str(amount)).quantize(Decimal("1"), ROUND_HALF_UP)
     return f"{d:,}".replace(",", " ")  # неразрывный пробел — чтобы число не разрывалось переносом
+
+# Регулярка для эмодзи: основные блоки Misc/Pictographs, Emoticons, Transport,
+# Supplemental, Misc Symbols + Dingbats и selector-16. Используется только при
+# экспорте в Excel — в JSON и в боте эмодзи остаются на своих местах.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"   # символы и пиктограммы
+    "\U0001F600-\U0001F64F"   # эмоции
+    "\U0001F680-\U0001F6FF"   # транспорт / карта (включая 🛒)
+    "\U0001F900-\U0001F9FF"   # supplemental (включая 🧾)
+    "☀-➿"           # misc symbols + dingbats (✏️, ❌, ◀️ и т.п.)
+    "️"                   # variation selector-16
+    "]+"
+)
+
+
+def _strip_emoji(s) -> str:
+    if not s:
+        return ""
+    return _EMOJI_RE.sub("", s).strip()
+
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции — inline-клавиатуры
@@ -702,13 +724,13 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Лист 1: Наличные — Поступления
     ws1 = wb.active
     ws1.title = "Наличные Поступления"
-    rows = [[t["date"], float(t["amount"]), t.get("category") or ""]
+    rows = [[t["date"], float(t["amount"]), _strip_emoji(t.get("category"))]
             for t in txs if t.get("account") == "cash" and t["type"] == "income"]
     build_sheet(ws1, rows, ["Дата", "Сумма (₽)", "Категория"], income_fill)
 
     # Лист 2: Наличные — Списания
     ws2 = wb.create_sheet("Наличные Списания")
-    rows = [[t["date"], float(t["amount"]), t.get("category") or "", t.get("note") or ""]
+    rows = [[t["date"], float(t["amount"]), _strip_emoji(t.get("category")), _strip_emoji(t.get("note"))]
             for t in txs if t.get("account") == "cash" and t["type"] == "expense"]
     build_sheet(ws2, rows, ["Дата", "Сумма (₽)", "Категория", "Примечание"], expense_fill, has_note=True)
 
@@ -720,7 +742,7 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Лист 4: Карта — Списания
     ws4 = wb.create_sheet("Карта Списания")
-    rows = [[t["date"], float(t["amount"]), t.get("category") or "", t.get("note") or ""]
+    rows = [[t["date"], float(t["amount"]), _strip_emoji(t.get("category")), _strip_emoji(t.get("note"))]
             for t in txs if t.get("account") == "card" and t["type"] == "expense"]
     build_sheet(ws4, rows, ["Дата", "Сумма (₽)", "Категория", "Примечание"], expense_fill, has_note=True)
 
