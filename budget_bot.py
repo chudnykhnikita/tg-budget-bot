@@ -50,7 +50,16 @@ logger = logging.getLogger(__name__)
     ST_ENTERING_REQUEST_AMOUNT, # ввод суммы запроса
 ) = range(7)
 
-EDIT_LIST, EDIT_CHOOSE_FIELD, EDIT_ENTERING_VALUE = range(7, 10)
+(
+    EDIT_CHOOSE_TYPE,       # выбор: Наличные / Карта / Запросы
+    EDIT_CHOOSE_DIRECTION,  # выбор: Поступления / Списания
+    EDIT_LIST,              # пагинированный список операций или запросов
+    EDIT_CHOOSE_FIELD,      # выбор поля для редактирования или удаления
+    EDIT_ENTERING_VALUE,    # ввод нового значения
+    EDIT_CONFIRM_DELETE,    # подтверждение удаления
+) = range(7, 13)
+
+EDIT_PAGE_SIZE = 5
 
 # ---------------------------------------------------------------------------
 # Константы
@@ -248,8 +257,6 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "История" in text:
         await history(update, context)
         return ConversationHandler.END
-    if "Изменить" in text:
-        return await edit_start(update, context)
     if "Запросил" in text:
         await update.message.reply_text(
             "Введи запрошенную сумму:",
@@ -750,34 +757,196 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Редактирование / удаление
 # ---------------------------------------------------------------------------
 
-async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.effective_user.id
-    data     = await asyncio.to_thread(load_data)
-    user_txs = [t for t in data["transactions"] if t["user_id"] == user_id]
+# --- Вспомогательные функции для отрисовки экранов редактирования ---------
 
-    if not user_txs:
-        await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
-        return ConversationHandler.END
+def _edit_item_label(item: dict, is_request: bool) -> str:
+    if is_request:
+        return f"📨 {fmt(item['amount'])} ₽   {item['date']}"
+    sign = "➕" if item["type"] == "income" else "➖"
+    cat  = f" · {item['category']}" if item.get("category") else ""
+    note = f" · {item['note']}"     if item.get("note")     else ""
+    return f"{sign} {fmt(item['amount'])}₽{cat}{note}   {item['date']}"
 
-    recent  = user_txs[-20:][::-1]
-    buttons = []
-    for t in recent:
-        acc  = "💵" if t.get("account") == "cash" else "💳"
-        cat  = f" · {t['category']}" if t.get("category") else ""
-        note = f" · {t['note']}" if t.get("note") else ""
-        sign = "➕" if t["type"] == "income" else "➖"
-        label = f"{acc}{sign} {fmt(t['amount'])}₽{cat}{note}  {t['date']}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"sel:{t['id']}")])
 
-    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel")])
-    await update.message.reply_text(
-        "Выбери операцию:",
+def _edit_get_filtered(data: dict, user_id: int, flt: dict) -> list[dict]:
+    if flt["type"] == "requests":
+        items = [r for r in data["requests"] if r["user_id"] == user_id]
+    else:
+        account   = flt["type"]      # "cash" | "card"
+        direction = flt["direction"] # "income" | "expense"
+        items = [
+            t for t in data["transactions"]
+            if t["user_id"] == user_id
+            and t.get("account") == account
+            and t["type"]       == direction
+        ]
+    # Свежие сверху
+    return items[::-1]
+
+
+async def _edit_render_type_picker(target):
+    """target — это update.message (на старте) или callback_query (после кликов)."""
+    buttons = [
+        [InlineKeyboardButton("💵 Наличные", callback_data="edit_type:cash")],
+        [InlineKeyboardButton("💳 Карта",    callback_data="edit_type:card")],
+        [InlineKeyboardButton("📨 Запросы",  callback_data="edit_type:requests")],
+        [InlineKeyboardButton("❌ Отмена",   callback_data="edit_cancel")],
+    ]
+    text = "Что редактируем?"
+    kb   = InlineKeyboardMarkup(buttons)
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, reply_markup=kb)
+    else:
+        await target.reply_text(text, reply_markup=kb)
+
+
+async def _edit_render_direction_picker(query, account: str):
+    acc_label = "💵 Наличные" if account == "cash" else "💳 Карта"
+    buttons = [
+        [InlineKeyboardButton("➕ Поступления", callback_data="edit_dir:income")],
+        [InlineKeyboardButton("➖ Списания",    callback_data="edit_dir:expense")],
+        [
+            InlineKeyboardButton("◀️ Назад",  callback_data="edit_back_type"),
+            InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+        ],
+    ]
+    await query.edit_message_text(
+        f"{acc_label}\nПоступления или списания?",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
-    return EDIT_LIST
 
 
-async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _edit_render_list(query, context, user_id: int):
+    flt  = context.user_data["edit_filter"]
+    data = await asyncio.to_thread(load_data)
+    items = _edit_get_filtered(data, user_id, flt)
+    is_request = flt["type"] == "requests"
+
+    # Заголовок
+    if is_request:
+        title = "📨 Запросы"
+    else:
+        acc  = "💵 Наличные" if flt["type"] == "cash" else "💳 Карта"
+        dirn = "Поступления" if flt["direction"] == "income" else "Списания"
+        title = f"{acc} → {dirn}"
+
+    if not items:
+        buttons = [[
+            InlineKeyboardButton(
+                "◀️ Назад",
+                callback_data="edit_back_type" if is_request else "edit_back_dir",
+            ),
+            InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+        ]]
+        await query.edit_message_text(
+            f"{title}\n\nПока нет операций.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    total_pages = max(1, (len(items) + EDIT_PAGE_SIZE - 1) // EDIT_PAGE_SIZE)
+    page = max(0, min(flt.get("page", 0), total_pages - 1))
+    flt["page"] = page
+
+    start = page * EDIT_PAGE_SIZE
+    page_items = items[start:start + EDIT_PAGE_SIZE]
+
+    buttons = []
+    for it in page_items:
+        cb = f"edit_sel:{it['id']}"
+        buttons.append([InlineKeyboardButton(_edit_item_label(it, is_request), callback_data=cb)])
+
+    # Навигация по страницам
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"edit_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"стр. {page + 1}/{total_pages}", callback_data="edit_noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"edit_page:{page + 1}"))
+    if len(nav) > 1:  # не показываем единственную плашку без стрелок
+        buttons.append(nav)
+
+    buttons.append([
+        InlineKeyboardButton(
+            "◀️ Назад",
+            callback_data="edit_back_type" if is_request else "edit_back_dir",
+        ),
+        InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+    ])
+
+    await query.edit_message_text(
+        f"{title}\nВыбери операцию:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _edit_render_item(query, context, item: dict, is_request: bool):
+    if is_request:
+        desc = (
+            f"📨 Запрос\n"
+            f"Сумма: {fmt(item['amount'])} ₽\n"
+            f"Дата: {item['date']}"
+        )
+        buttons = [
+            [InlineKeyboardButton("✏️ Сумму",  callback_data="edit_field:amount")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data="edit_delete")],
+            [
+                InlineKeyboardButton("◀️ Назад",  callback_data="edit_back_list"),
+                InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+            ],
+        ]
+    else:
+        acc    = "💵 Наличные" if item.get("account") == "cash" else "💳 Карта"
+        d_type = "Поступление" if item["type"] == "income" else "Списание"
+        cat    = item.get("category") or "—"
+        note   = item.get("note") or "—"
+        desc = (
+            f"{acc} | {d_type}\n"
+            f"Сумма: {fmt(item['amount'])} ₽\n"
+            f"Категория: {cat}\n"
+            f"Примечание: {note}\n"
+            f"Дата: {item['date']}"
+        )
+        buttons = [
+            [InlineKeyboardButton("✏️ Сумму",      callback_data="edit_field:amount")],
+            [InlineKeyboardButton("✏️ Категорию",  callback_data="edit_field:category")],
+            [InlineKeyboardButton("✏️ Примечание", callback_data="edit_field:note")],
+            [InlineKeyboardButton("🗑 Удалить",    callback_data="edit_delete")],
+            [
+                InlineKeyboardButton("◀️ Назад",  callback_data="edit_back_list"),
+                InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+            ],
+        ]
+    await query.edit_message_text(desc, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def _edit_render_delete_confirm(query, item: dict, is_request: bool):
+    if is_request:
+        text = f"Удалить запрос {fmt(item['amount'])} ₽ от {item['date']}?"
+    else:
+        sign = "+" if item["type"] == "income" else "−"
+        cat  = f" · {item['category']}" if item.get("category") else ""
+        text = f"Удалить операцию {sign}{fmt(item['amount'])} ₽{cat} от {item['date']}?"
+    buttons = [[
+        InlineKeyboardButton("🗑 Да, удалить", callback_data="edit_confirm_yes"),
+        InlineKeyboardButton("↩️ Нет",         callback_data="edit_confirm_no"),
+    ]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+# --- Обработчики ----------------------------------------------------------
+
+async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Точка входа: команда /edit или кнопка «✏️ Изменить»."""
+    context.user_data.pop("edit_filter", None)
+    context.user_data.pop("edit_tx_id", None)
+    context.user_data.pop("edit_is_request", None)
+    context.user_data.pop("edit_field", None)
+    await _edit_render_type_picker(update.message)
+    return EDIT_CHOOSE_TYPE
+
+
+async def edit_pick_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -785,83 +954,177 @@ async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Отменено.")
         return ConversationHandler.END
 
-    tx_id = query.data.split(":", 1)[1]
-    data  = await asyncio.to_thread(load_data)
-    t     = next((x for x in data["transactions"] if x["id"] == tx_id), None)
+    if not query.data.startswith("edit_type:"):
+        return EDIT_CHOOSE_TYPE
 
-    if t is None or t["user_id"] != update.effective_user.id:
-        await query.edit_message_text("⛔ Операция недоступна.")
-        return ConversationHandler.END
+    typ = query.data.split(":", 1)[1]   # "cash" | "card" | "requests"
+    context.user_data["edit_filter"] = {"type": typ, "page": 0}
 
-    context.user_data["edit_tx_id"] = tx_id
-    acc   = "💵 Наличные" if t.get("account") == "cash" else "💳 Карта"
-    cat   = t.get("category") or "—"
-    note  = t.get("note") or "—"
-    d_type = "Поступление" if t["type"] == "income" else "Списание"
-    desc  = f"{acc} | {d_type}\nСумма: {fmt(t['amount'])} ₽\nКатегория: {cat}\nПримечание: {note}\nДата: {t['date']}"
+    if typ == "requests":
+        await _edit_render_list(query, context, update.effective_user.id)
+        return EDIT_LIST
 
-    buttons = [
-        [InlineKeyboardButton("✏️ Сумму",       callback_data="edit_field:amount")],
-        [InlineKeyboardButton("✏️ Категорию",   callback_data="edit_field:category")],
-        [InlineKeyboardButton("✏️ Примечание",  callback_data="edit_field:note")],
-        [InlineKeyboardButton("🗑 Удалить",      callback_data="edit_delete")],
-        [InlineKeyboardButton("◀️ Назад",        callback_data="edit_back")],
-    ]
-    await query.edit_message_text(desc, reply_markup=InlineKeyboardMarkup(buttons))
-    return EDIT_CHOOSE_FIELD
+    await _edit_render_direction_picker(query, typ)
+    return EDIT_CHOOSE_DIRECTION
 
 
-async def edit_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def edit_pick_direction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "edit_back":
-        user_id  = update.effective_user.id
-        data     = await asyncio.to_thread(load_data)
-        user_txs = [t for t in data["transactions"] if t["user_id"] == user_id]
-        recent   = user_txs[-20:][::-1]
-        buttons  = []
-        for t in recent:
-            acc  = "💵" if t.get("account") == "cash" else "💳"
-            cat  = f" · {t['category']}" if t.get("category") else ""
-            note = f" · {t['note']}" if t.get("note") else ""
-            sign = "➕" if t["type"] == "income" else "➖"
-            label = f"{acc}{sign} {fmt(t['amount'])}₽{cat}{note}  {t['date']}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"sel:{t['id']}")])
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel")])
-        await query.edit_message_text("Выбери операцию:", reply_markup=InlineKeyboardMarkup(buttons))
+    if query.data == "edit_cancel":
+        await query.edit_message_text("❌ Отменено.")
+        return ConversationHandler.END
+
+    if query.data == "edit_back_type":
+        await _edit_render_type_picker(query)
+        return EDIT_CHOOSE_TYPE
+
+    if not query.data.startswith("edit_dir:"):
+        return EDIT_CHOOSE_DIRECTION
+
+    direction = query.data.split(":", 1)[1]
+    context.user_data["edit_filter"]["direction"] = direction
+    context.user_data["edit_filter"]["page"] = 0
+
+    await _edit_render_list(query, context, update.effective_user.id)
+    return EDIT_LIST
+
+
+async def edit_list_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "edit_cancel":
+        await query.edit_message_text("❌ Отменено.")
+        return ConversationHandler.END
+
+    if query.data == "edit_noop":
+        return EDIT_LIST
+
+    if query.data == "edit_back_type":
+        await _edit_render_type_picker(query)
+        return EDIT_CHOOSE_TYPE
+
+    if query.data == "edit_back_dir":
+        flt = context.user_data["edit_filter"]
+        await _edit_render_direction_picker(query, flt["type"])
+        return EDIT_CHOOSE_DIRECTION
+
+    if query.data.startswith("edit_page:"):
+        page = int(query.data.split(":", 1)[1])
+        context.user_data["edit_filter"]["page"] = page
+        await _edit_render_list(query, context, update.effective_user.id)
+        return EDIT_LIST
+
+    if query.data.startswith("edit_sel:"):
+        item_id = query.data.split(":", 1)[1]
+        flt     = context.user_data["edit_filter"]
+        is_req  = flt["type"] == "requests"
+        data    = await asyncio.to_thread(load_data)
+        coll    = data["requests"] if is_req else data["transactions"]
+        item    = next((x for x in coll if x["id"] == item_id), None)
+        if item is None or item["user_id"] != update.effective_user.id:
+            await query.edit_message_text("⛔ Операция недоступна.")
+            return ConversationHandler.END
+        context.user_data["edit_tx_id"]      = item_id
+        context.user_data["edit_is_request"] = is_req
+        await _edit_render_item(query, context, item, is_req)
+        return EDIT_CHOOSE_FIELD
+
+    return EDIT_LIST
+
+
+async def edit_field_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "edit_cancel":
+        await query.edit_message_text("❌ Отменено.")
+        return ConversationHandler.END
+
+    if query.data == "edit_back_list":
+        await _edit_render_list(query, context, update.effective_user.id)
         return EDIT_LIST
 
     if query.data == "edit_delete":
-        tx_id = context.user_data.get("edit_tx_id")
-        data  = await asyncio.to_thread(load_data)
-        t     = next((x for x in data["transactions"] if x["id"] == tx_id), None)
-        if t is None or t["user_id"] != update.effective_user.id:
+        tx_id  = context.user_data.get("edit_tx_id")
+        is_req = context.user_data.get("edit_is_request", False)
+        data   = await asyncio.to_thread(load_data)
+        coll   = data["requests"] if is_req else data["transactions"]
+        item   = next((x for x in coll if x["id"] == tx_id), None)
+        if item is None or item["user_id"] != update.effective_user.id:
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
-        data["transactions"] = [x for x in data["transactions"] if x["id"] != tx_id]
-        await save_data(data)
-        await query.edit_message_text(f"🗑 Операция {fmt(t['amount'])} ₽ удалена.")
-        return ConversationHandler.END
+        await _edit_render_delete_confirm(query, item, is_req)
+        return EDIT_CONFIRM_DELETE
 
     if query.data.startswith("edit_field:"):
-        field = query.data.split(":")[1]
+        field  = query.data.split(":", 1)[1]
+        is_req = context.user_data.get("edit_is_request", False)
+        # У запросов редактируется только сумма
+        if is_req and field != "amount":
+            return EDIT_CHOOSE_FIELD
         context.user_data["edit_field"] = field
-        prompts = {"amount": "Введи новую сумму:", "category": "Введи новую категорию:", "note": "Введи новое примечание:"}
+        prompts = {
+            "amount":   "Введи новую сумму:",
+            "category": "Введи новую категорию:",
+            "note":     "Введи новое примечание:",
+        }
         await query.edit_message_text(prompts.get(field, "Введи значение:"))
         return EDIT_ENTERING_VALUE
 
     return EDIT_CHOOSE_FIELD
 
 
+async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "edit_confirm_no":
+        # Возврат к карточке операции
+        tx_id  = context.user_data.get("edit_tx_id")
+        is_req = context.user_data.get("edit_is_request", False)
+        data   = await asyncio.to_thread(load_data)
+        coll   = data["requests"] if is_req else data["transactions"]
+        item   = next((x for x in coll if x["id"] == tx_id), None)
+        if item is None or item["user_id"] != update.effective_user.id:
+            await query.edit_message_text("⛔ Операция недоступна.")
+            return ConversationHandler.END
+        await _edit_render_item(query, context, item, is_req)
+        return EDIT_CHOOSE_FIELD
+
+    if query.data == "edit_confirm_yes":
+        tx_id  = context.user_data.get("edit_tx_id")
+        is_req = context.user_data.get("edit_is_request", False)
+        data   = await asyncio.to_thread(load_data)
+        key    = "requests" if is_req else "transactions"
+        item   = next((x for x in data[key] if x["id"] == tx_id), None)
+        if item is None or item["user_id"] != update.effective_user.id:
+            await query.edit_message_text("⛔ Операция недоступна.")
+            return ConversationHandler.END
+        data[key] = [x for x in data[key] if x["id"] != tx_id]
+        await save_data(data)
+        if is_req:
+            msg = f"🗑 Запрос {fmt(item['amount'])} ₽ удалён."
+        else:
+            msg = f"🗑 Операция {fmt(item['amount'])} ₽ удалена."
+        await query.edit_message_text(msg)
+        return ConversationHandler.END
+
+    return EDIT_CONFIRM_DELETE
+
+
 async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    field = context.user_data.get("edit_field")
-    tx_id = context.user_data.get("edit_tx_id")
-    text  = (update.message.text or "").strip()
+    field  = context.user_data.get("edit_field")
+    tx_id  = context.user_data.get("edit_tx_id")
+    is_req = context.user_data.get("edit_is_request", False)
+    text   = (update.message.text or "").strip()
 
     data = await asyncio.to_thread(load_data)
-    t    = next((x for x in data["transactions"] if x["id"] == tx_id), None)
-    if t is None or t["user_id"] != update.effective_user.id:
+    key  = "requests" if is_req else "transactions"
+    item = next((x for x in data[key] if x["id"] == tx_id), None)
+    if item is None or item["user_id"] != update.effective_user.id:
         await update.message.reply_text("⛔ Операция недоступна.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
@@ -871,14 +1134,14 @@ async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except ValueError:
             await update.message.reply_text("❌ Введи корректную сумму:")
             return EDIT_ENTERING_VALUE
-        t["amount"] = str(new_val)
+        item["amount"] = str(new_val)
         msg = f"✅ Сумма обновлена: {fmt(new_val)} ₽"
     elif field == "category":
-        t["category"] = text[:MAX_NOTE_LEN]
-        msg = f"✅ Категория обновлена: {t['category']}"
+        item["category"] = text[:MAX_NOTE_LEN]
+        msg = f"✅ Категория обновлена: {item['category']}"
     else:
-        t["note"] = text[:MAX_NOTE_LEN]
-        msg = f"✅ Примечание обновлено: {t['note']}"
+        item["note"] = text[:MAX_NOTE_LEN]
+        msg = f"✅ Примечание обновлено: {item['note']}"
 
     await save_data(data)
     await update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD)
@@ -940,7 +1203,7 @@ def main():
     app.add_error_handler(on_error)
 
     main_filter = filters.Regex(
-        "^(💵 Наличные|💳 Карта|💰 Баланс|🕓 История|✏️ Изменить|📨 Запросил)$"
+        "^(💵 Наличные|💳 Карта|💰 Баланс|🕓 История|📨 Запросил)$"
     )
 
     add_conv = ConversationHandler(
@@ -960,11 +1223,35 @@ def main():
     )
 
     edit_conv = ConversationHandler(
-        entry_points=[CommandHandler("edit", edit_start)],
+        entry_points=[
+            CommandHandler("edit", edit_start),
+            MessageHandler(filters.Regex("^✏️ Изменить$"), edit_start),
+        ],
         states={
-            EDIT_LIST:          [CallbackQueryHandler(edit_select, pattern="^(sel:|edit_cancel)")],
-            EDIT_CHOOSE_FIELD:  [CallbackQueryHandler(edit_action, pattern="^(edit_field:|edit_delete|edit_back|edit_cancel)")],
-            EDIT_ENTERING_VALUE:[MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_value)],
+            EDIT_CHOOSE_TYPE: [
+                CallbackQueryHandler(edit_pick_type, pattern="^(edit_type:|edit_cancel$)"),
+            ],
+            EDIT_CHOOSE_DIRECTION: [
+                CallbackQueryHandler(edit_pick_direction, pattern="^(edit_dir:|edit_back_type$|edit_cancel$)"),
+            ],
+            EDIT_LIST: [
+                CallbackQueryHandler(
+                    edit_list_action,
+                    pattern="^(edit_sel:|edit_page:|edit_back_type$|edit_back_dir$|edit_noop$|edit_cancel$)",
+                ),
+            ],
+            EDIT_CHOOSE_FIELD: [
+                CallbackQueryHandler(
+                    edit_field_action,
+                    pattern="^(edit_field:|edit_delete$|edit_back_list$|edit_cancel$)",
+                ),
+            ],
+            EDIT_CONFIRM_DELETE: [
+                CallbackQueryHandler(edit_confirm_delete, pattern="^edit_confirm_(yes|no)$"),
+            ],
+            EDIT_ENTERING_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_value),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -976,8 +1263,10 @@ def main():
     app.add_handler(CommandHandler("export", export_excel))
     app.add_handler(CommandHandler("clear",  clear))
     app.add_handler(CallbackQueryHandler(clear_confirm, pattern="^clear_"))
-    app.add_handler(add_conv)
+    # edit_conv ставим первым: чтобы кнопка «✏️ Изменить» захватывалась им,
+    # а не общей add_conv (которая иначе съест регекспом из main_filter).
     app.add_handler(edit_conv)
+    app.add_handler(add_conv)
 
     logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
