@@ -189,7 +189,12 @@ def parse_amount(s: str) -> Decimal:
 
 
 def fmt(amount) -> str:
-    return f"{Decimal(str(amount)):.2f}"
+    """Форматирует сумму для отображения в боте: целое число с пробельными
+    разделителями тысяч. Копейки округляются (ROUND_HALF_UP).
+    Пример: Decimal('10000.00') → '10 000'.
+    Для Excel НЕ используется — там значения идут как float напрямую."""
+    d = Decimal(str(amount)).quantize(Decimal("1"), ROUND_HALF_UP)
+    return f"{d:,}".replace(",", " ")  # неразрывный пробел — чтобы число не разрывалось переносом
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции — inline-клавиатуры
@@ -765,7 +770,7 @@ def _edit_item_label(item: dict, is_request: bool) -> str:
     sign = "➕" if item["type"] == "income" else "➖"
     cat  = f" · {item['category']}" if item.get("category") else ""
     note = f" · {item['note']}"     if item.get("note")     else ""
-    return f"{sign} {fmt(item['amount'])}₽{cat}{note}   {item['date']}"
+    return f"{sign} {fmt(item['amount'])} ₽{cat}{note}   {item['date']}"
 
 
 def _edit_get_filtered(data: dict, user_id: int, flt: dict) -> list[dict]:
