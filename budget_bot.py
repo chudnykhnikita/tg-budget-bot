@@ -42,14 +42,16 @@ logger = logging.getLogger(__name__)
 # Состояния диалога
 # ---------------------------------------------------------------------------
 (
-    ST_CHOOSE_ACCOUNT,          # выбор счёта: Наличные / Карта
-    ST_CHOOSE_DIRECTION,        # выбор: Поступление / Списание
-    ST_ENTERING_AMOUNT,         # ввод суммы
-    ST_CHOOSE_CATEGORY,         # выбор категории кнопками (или свободный ввод)
-    ST_ENTERING_NOTE,           # ввод примечания 2-го уровня
-    ST_ENTERING_ZP_DATE,        # ввод даты для ЗП упаковщиков
-    ST_ENTERING_REQUEST_AMOUNT, # ввод суммы запроса
-) = range(7)
+    ST_CHOOSE_ACCOUNT,            # выбор счёта: Наличные / Карта
+    ST_CHOOSE_DIRECTION,          # выбор: Поступление / Списание
+    ST_ENTERING_AMOUNT,           # ввод суммы
+    ST_CHOOSE_CATEGORY,           # выбор категории кнопками (или свободный ввод)
+    ST_ENTERING_NOTE,             # ввод примечания 2-го уровня
+    ST_ENTERING_ZP_DATE,          # ввод даты для ЗП упаковщиков
+    ST_ENTERING_REQUEST_AMOUNT,   # ввод суммы запроса
+    ST_CHOOSE_TRANSFER_DIR,       # выбор направления перевода (карта↔наличные)
+    ST_ENTERING_TRANSFER_AMOUNT,  # ввод суммы перевода
+) = range(9)
 
 (
     EDIT_CHOOSE_TYPE,       # выбор: Наличные / Карта / Запросы
@@ -58,7 +60,7 @@ logger = logging.getLogger(__name__)
     EDIT_CHOOSE_FIELD,      # выбор поля для редактирования или удаления
     EDIT_ENTERING_VALUE,    # ввод нового значения
     EDIT_CONFIRM_DELETE,    # подтверждение удаления
-) = range(7, 13)
+) = range(9, 15)
 
 EDIT_PAGE_SIZE = 5
 
@@ -70,12 +72,13 @@ MOSCOW_TZ       = ZoneInfo("Europe/Moscow")
 MAX_NOTE_LEN    = 128
 
 # Категории (константы — используются и как лейблы кнопок, и как ключи).
-CAT_BANK  = "🏦 Плата банку"
-CAT_ZP    = "👷 ЗП упаковщиков"
-CAT_DIV   = "💎 Дивиденды"
-CAT_MEAL  = "🍽 Обеды"
-CAT_OFC   = "🏢 Офис"
-CAT_WH    = "📦 Склад"
+CAT_BANK       = "🏦 Плата банку"
+CAT_ZP         = "👷 ЗП упаковщиков"
+CAT_ZP_WORKERS = "💼 ЗП работников"
+CAT_DIV        = "💎 Дивиденды"
+CAT_MEAL       = "🍽 Обеды"
+CAT_OFC        = "🏢 Офис"
+CAT_WH         = "📦 Склад"
 
 CAT_SALE  = "🛒 Продажа со склада"
 
@@ -83,11 +86,13 @@ SUB_BANK_SERVICE = "🧾 Обслуживание счёта"
 SUB_BANK_FEE     = "💸 Комиссия"
 
 # Категории карты — списания
-CARD_EXPENSE_CATEGORIES = [CAT_BANK, CAT_ZP, CAT_DIV, CAT_MEAL, CAT_OFC, CAT_WH]
+CARD_EXPENSE_CATEGORIES = [CAT_BANK, CAT_ZP, CAT_ZP_WORKERS, CAT_DIV, CAT_MEAL, CAT_OFC, CAT_WH]
 # Подкатегории «Плата банку»
 BANK_SUBCATEGORIES = [SUB_BANK_SERVICE, SUB_BANK_FEE]
 # Подкатегории «Дивиденды» (имена без эмодзи)
 DIVIDEND_SUBCATEGORIES = ["Андрей", "Алексей", "Никита"]
+# Подкатегории «ЗП работников» — выплаты по частям
+WORKERS_SUBCATEGORIES = ["Никита 1 часть", "Никита 2 часть", "Михаил 1 часть", "Михаил 2 часть"]
 
 # Категории наличных — поступления (кнопки + свободный ввод)
 CASH_INCOME_CATEGORIES = [CAT_SALE]
@@ -105,6 +110,7 @@ BTN_CANCEL = "❌ Отмена"
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["💵 Наличные", "💳 Карта"],
+        ["🔄 Перевод"],
         ["💰 Баланс",   "🕓 История"],
         ["✏️ Изменить", "📨 Запросил"],
     ],
@@ -120,16 +126,17 @@ _lock = asyncio.Lock()
 
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
-        return {"transactions": [], "requests": []}
+        return {"transactions": [], "requests": [], "transfers": []}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError:
         logger.exception("Corrupted %s, backing up", DATA_FILE)
         os.rename(DATA_FILE, DATA_FILE + ".corrupt")
-        return {"transactions": [], "requests": []}
+        return {"transactions": [], "requests": [], "transfers": []}
     data.setdefault("transactions", [])
     data.setdefault("requests", [])
+    data.setdefault("transfers", [])
     return data
 
 
@@ -174,6 +181,21 @@ async def _save_request(user_id: int, amount: Decimal):
         "id":      str(uuid.uuid4()),
         "user_id": user_id,
         "amount":  str(amount),
+        "date":    now,
+    })
+    await save_data(data)
+
+
+async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str):
+    """src/dst: 'cash' или 'card'."""
+    now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    data = await asyncio.to_thread(load_data)
+    data["transfers"].append({
+        "id":      str(uuid.uuid4()),
+        "user_id": user_id,
+        "amount":  str(amount),
+        "from":    src,
+        "to":      dst,
         "date":    now,
     })
     await save_data(data)
@@ -292,6 +314,18 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
         return ST_ENTERING_REQUEST_AMOUNT
+
+    if "Перевод" in text:
+        kb = ReplyKeyboardMarkup(
+            [
+                ["💳 → 💵  Карта → Наличные"],
+                ["💵 → 💳  Наличные → Карта"],
+                [BTN_CANCEL],
+            ],
+            resize_keyboard=True, one_time_keyboard=True,
+        )
+        await update.message.reply_text("Куда переводим?", reply_markup=kb)
+        return ST_CHOOSE_TRANSFER_DIR
 
     if "Наличные" in text:
         context.user_data["account"] = "cash"
@@ -414,6 +448,13 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["category"] = text
             kb = _reply_kb(DIVIDEND_SUBCATEGORIES)
             await update.message.reply_text("Кому?", reply_markup=kb)
+            context.user_data["awaiting_subcategory"] = True
+            return ST_CHOOSE_CATEGORY
+
+        if text == CAT_ZP_WORKERS:
+            context.user_data["category"] = text
+            kb = _reply_kb(WORKERS_SUBCATEGORIES)
+            await update.message.reply_text("Кому и какая часть?", reply_markup=kb)
             context.user_data["awaiting_subcategory"] = True
             return ST_CHOOSE_CATEGORY
 
@@ -568,6 +609,72 @@ async def handle_request_amount(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
+# Переводы между счетами
+# ---------------------------------------------------------------------------
+
+async def handle_transfer_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    if BTN_CANCEL in text:
+        return await cancel(update, context)
+
+    if "Карта → Наличные" in text:
+        context.user_data["transfer"] = {"from": "card", "to": "cash"}
+    elif "Наличные → Карта" in text:
+        context.user_data["transfer"] = {"from": "cash", "to": "card"}
+    else:
+        return ST_CHOOSE_TRANSFER_DIR
+
+    await update.message.reply_text(
+        "Введи сумму перевода:",
+        reply_markup=ReplyKeyboardMarkup(
+            [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+        ),
+    )
+    return ST_ENTERING_TRANSFER_AMOUNT
+
+
+async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if BTN_CANCEL in text:
+        return await cancel(update, context)
+
+    try:
+        amount = parse_amount(text)
+    except ValueError:
+        await update.message.reply_text("❌ Введи корректную сумму (например: 5000 или 99.90)")
+        return ST_ENTERING_TRANSFER_AMOUNT
+
+    tr  = context.user_data.get("transfer", {})
+    src = tr.get("from")
+    dst = tr.get("to")
+    if src not in ("cash", "card") or dst not in ("cash", "card") or src == dst:
+        await update.message.reply_text(
+            "⚠️ Что-то пошло не так с направлением. Попробуй ещё раз.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    try:
+        await _save_transfer(user_id, amount, src, dst)
+    except OSError:
+        logger.exception("Failed to save transfer")
+        await update.message.reply_text(
+            "⚠️ Не удалось сохранить перевод, попробуй ещё раз.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    src_lbl = "💳 Карта" if src == "card" else "💵 Наличные"
+    dst_lbl = "💳 Карта" if dst == "card" else "💵 Наличные"
+    await update.message.reply_text(
+        f"✅ Перевод {fmt(amount)} ₽\n{src_lbl} → {dst_lbl} сохранён.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    context.user_data.pop("transfer", None)
+    return ConversationHandler.END
+
+# ---------------------------------------------------------------------------
 # Баланс
 # ---------------------------------------------------------------------------
 
@@ -576,8 +683,9 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
     reqs    = [r for r in data["requests"]     if r["user_id"] == user_id]
+    trs     = [t for t in data["transfers"]    if t["user_id"] == user_id]
 
-    if not txs and not reqs:
+    if not txs and not reqs and not trs:
         await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
         return
 
@@ -588,8 +696,17 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cash_inc, cash_exp = totals("cash")
     card_inc, card_exp = totals("card")
-    cash_bal = cash_inc - cash_exp
-    card_bal = card_inc - card_exp
+
+    # Переводы: чистое движение по каждому счёту
+    cash_tr_in  = sum(Decimal(t["amount"]) for t in trs if t["to"]   == "cash")
+    cash_tr_out = sum(Decimal(t["amount"]) for t in trs if t["from"] == "cash")
+    card_tr_in  = sum(Decimal(t["amount"]) for t in trs if t["to"]   == "card")
+    card_tr_out = sum(Decimal(t["amount"]) for t in trs if t["from"] == "card")
+    cash_tr_net = cash_tr_in - cash_tr_out
+    card_tr_net = card_tr_in - card_tr_out
+
+    cash_bal = cash_inc - cash_exp + cash_tr_net
+    card_bal = card_inc - card_exp + card_tr_net
     total    = cash_bal + card_bal
 
     # Запросы: сколько запрошено и сколько ещё не пришло (минус поступления на карту)
@@ -620,14 +737,22 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  • {k}: {fmt(v)} ₽" for k, v in sorted_cats
         )
 
+    def _signed(v: Decimal) -> str:
+        return ("+" + fmt(v)) if v > 0 else fmt(v)
+
+    cash_tr_line = (f"  Переводы:    {_signed(cash_tr_net)} ₽\n" if trs else "")
+    card_tr_line = (f"  Переводы:    {_signed(card_tr_net)} ₽\n" if trs else "")
+
     text = (
         f"💵 Наличные\n"
         f"  Поступления: {fmt(cash_inc)} ₽\n"
         f"  Списания:    {fmt(cash_exp)} ₽\n"
+        f"{cash_tr_line}"
         f"  Баланс:      {fmt(cash_bal)} ₽\n\n"
         f"💳 Карта\n"
         f"  Поступления: {fmt(card_inc)} ₽\n"
         f"  Списания:    {fmt(card_exp)} ₽\n"
+        f"{card_tr_line}"
         f"  Баланс:      {fmt(card_bal)} ₽\n\n"
         f"{'✅' if total >= 0 else '⚠️'} Общий баланс: {fmt(total)} ₽"
         f"{req_lines}"
@@ -686,8 +811,9 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
     reqs    = [r for r in data["requests"]     if r["user_id"] == user_id]
+    trs     = [t for t in data["transfers"]    if t["user_id"] == user_id]
 
-    if not txs and not reqs:
+    if not txs and not reqs and not trs:
         await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
         return
 
@@ -696,6 +822,7 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     income_fill    = PatternFill("solid", start_color="1E7E34")
     expense_fill   = PatternFill("solid", start_color="C0392B")
     request_fill   = PatternFill("solid", start_color="2980B9")
+    transfer_fill  = PatternFill("solid", start_color="6C3483")
 
     def style_header(cell, fill):
         cell.font      = header_font
@@ -769,6 +896,17 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws5[f"B{rem_r}"] = f"=B{total_r}-B{rec_r}"
         ws5[f"B{rem_r}"].font = Font(name="Arial", bold=True)
         ws5.column_dimensions["A"].width = 22
+
+    # Лист 6: Переводы (карта ↔ наличные)
+    ws6 = wb.create_sheet("Переводы")
+
+    def _dir_label(t: dict) -> str:
+        src = "Карта" if t.get("from") == "card" else "Наличные"
+        dst = "Карта" if t.get("to")   == "card" else "Наличные"
+        return f"{src} → {dst}"
+
+    tr_rows = [[t["date"], float(t["amount"]), _dir_label(t)] for t in trs]
+    build_sheet(ws6, tr_rows, ["Дата", "Сумма (₽)", "Направление"], transfer_fill)
 
     buf = BytesIO()
     wb.save(buf)
@@ -1194,6 +1332,7 @@ async def clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         data["transactions"] = [t for t in data["transactions"] if t["user_id"] != user_id]
         data["requests"]     = [r for r in data["requests"]     if r["user_id"] != user_id]
+        data["transfers"]    = [t for t in data["transfers"]    if t["user_id"] != user_id]
         await save_data(data)
         await query.edit_message_text("🗑 Все твои данные удалены.")
     else:
@@ -1230,18 +1369,20 @@ def main():
     app.add_error_handler(on_error)
 
     main_filter = filters.Regex(
-        "^(💵 Наличные|💳 Карта|💰 Баланс|🕓 История|📨 Запросил)$"
+        "^(💵 Наличные|💳 Карта|💰 Баланс|🕓 История|📨 Запросил|🔄 Перевод)$"
     )
 
     add_conv = ConversationHandler(
         entry_points=[MessageHandler(main_filter, handle_account)],
         states={
-            ST_CHOOSE_DIRECTION:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direction)],
-            ST_ENTERING_AMOUNT:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount)],
-            ST_CHOOSE_CATEGORY:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category)],
-            ST_ENTERING_ZP_DATE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_zp_date)],
-            ST_ENTERING_NOTE:           [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note)],
-            ST_ENTERING_REQUEST_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_request_amount)],
+            ST_CHOOSE_DIRECTION:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direction)],
+            ST_ENTERING_AMOUNT:          [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount)],
+            ST_CHOOSE_CATEGORY:          [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category)],
+            ST_ENTERING_ZP_DATE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_zp_date)],
+            ST_ENTERING_NOTE:            [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note)],
+            ST_ENTERING_REQUEST_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_request_amount)],
+            ST_CHOOSE_TRANSFER_DIR:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_dir)],
+            ST_ENTERING_TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_amount)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
