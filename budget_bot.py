@@ -137,6 +137,23 @@ def load_data() -> dict:
     data.setdefault("transactions", [])
     data.setdefault("requests", [])
     data.setdefault("transfers", [])
+
+    # Миграция транзакций старого формата (до cash/card-разделения):
+    # дополняем отсутствующие id/account/note, нормализуем amount к строке "X.XX".
+    # Изменения сохранятся в файл при ближайшем save_data().
+    for t in data["transactions"]:
+        if "id" not in t:
+            t["id"] = str(uuid.uuid4())
+        if "account" not in t:
+            t["account"] = "card"   # legacy default — большинство операций были по карте
+        if "note" not in t:
+            t["note"] = None
+        amt = t.get("amount", 0)
+        try:
+            t["amount"] = str(Decimal(str(amt)).quantize(Decimal("0.01"), ROUND_HALF_UP))
+        except (InvalidOperation, ValueError):
+            t["amount"] = "0.00"
+
     return data
 
 
