@@ -450,7 +450,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.pop("awaiting_free_category", False):
         category = text[:MAX_NOTE_LEN]
         context.user_data["category"] = category
-        return await _maybe_ask_note(update, context)
+        return await _finish(update, context, category=category, note=None)
 
     # Карта — списание: подкатегории
     if account == "card" and direction == "expense":
