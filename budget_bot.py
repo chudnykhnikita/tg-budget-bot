@@ -6,7 +6,7 @@ import asyncio
 import tempfile
 import uuid
 import warnings
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
@@ -100,9 +100,11 @@ CASH_INCOME_CATEGORIES = [CAT_SALE]
 # Категории наличных — списания (кнопки + свободный ввод)
 CASH_EXPENSE_CATEGORIES = [CAT_ZP]
 
-BTN_FREE   = "✏️ Свой вариант"
-BTN_TODAY  = "📅 Сегодня"
-BTN_CANCEL = "❌ Отмена"
+BTN_FREE              = "✏️ Свой вариант"
+BTN_TODAY             = "📅 Сегодня"
+BTN_YESTERDAY         = "📅 Вчера"
+BTN_BEFORE_YESTERDAY  = "📅 Позавчера"
+BTN_CANCEL            = "❌ Отмена"
 
 # ---------------------------------------------------------------------------
 # Главная клавиатура
@@ -306,13 +308,13 @@ def _strip_emoji(s) -> str:
 # Вспомогательные функции — клавиатуры
 # ---------------------------------------------------------------------------
 
-def _reply_kb(options: list[str], add_free: bool = False, add_today: bool = False,
+def _reply_kb(options: list[str], add_free: bool = False, add_dates: bool = False,
               cols: int = 2) -> ReplyKeyboardMarkup:
     # Раскладываем варианты сеткой по `cols` колонок (по умолчанию 2),
     # как основная клавиатура.
     rows = [options[i:i + cols] for i in range(0, len(options), cols)]
-    if add_today:
-        rows.append([BTN_TODAY])
+    if add_dates:
+        rows.append([BTN_TODAY, BTN_YESTERDAY, BTN_BEFORE_YESTERDAY])
     if add_free:
         rows.append([BTN_FREE])
     rows.append([BTN_CANCEL])
@@ -517,7 +519,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == CAT_ZP:
             context.user_data["category"] = text
-            kb = _reply_kb([], add_today=True)
+            kb = _reply_kb([], add_dates=True)
             await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
             context.user_data["awaiting_zp_date"] = True
             return ST_ENTERING_ZP_DATE
@@ -540,7 +542,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Наличные — ЗП упаковщиков
     if text == CAT_ZP:
         context.user_data["category"] = text
-        kb = _reply_kb([], add_today=True)
+        kb = _reply_kb([], add_dates=True)
         await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
         context.user_data["awaiting_zp_date"] = True
         return ST_ENTERING_ZP_DATE
@@ -555,8 +557,13 @@ async def handle_zp_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if BTN_CANCEL in text:
         return await cancel(update, context)
 
+    today = date.today()
     if text == BTN_TODAY:
-        note = date.today().strftime("%d.%m.%Y")
+        note = today.strftime("%d.%m.%Y")
+    elif text == BTN_YESTERDAY:
+        note = (today - timedelta(days=1)).strftime("%d.%m.%Y")
+    elif text == BTN_BEFORE_YESTERDAY:
+        note = (today - timedelta(days=2)).strftime("%d.%m.%Y")
     else:
         note = text[:MAX_NOTE_LEN]
 
