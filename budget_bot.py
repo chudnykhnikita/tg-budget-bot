@@ -124,23 +124,18 @@ _lock = asyncio.Lock()
 # Работа с данными
 # ---------------------------------------------------------------------------
 
-def load_data() -> dict:
-    if not os.path.exists(DATA_FILE):
-        return {"transactions": [], "requests": [], "transfers": []}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except json.JSONDecodeError:
-        logger.exception("Corrupted %s, backing up", DATA_FILE)
-        os.rename(DATA_FILE, DATA_FILE + ".corrupt")
-        return {"transactions": [], "requests": [], "transfers": []}
+def _empty_data() -> dict:
+    return {"transactions": [], "requests": [], "transfers": []}
+
+
+def _migrate(data: dict) -> dict:
+    """Идемпотентная миграция данных к актуальной схеме."""
     data.setdefault("transactions", [])
     data.setdefault("requests", [])
     data.setdefault("transfers", [])
 
-    # Миграция транзакций старого формата (до cash/card-разделения):
-    # дополняем отсутствующие id/account/note, нормализуем amount к строке "X.XX".
-    # Изменения сохранятся в файл при ближайшем save_data().
+    # Транзакции до cash/card-разделения: дополняем id/account/note,
+    # подстраховываемся от отсутствующего type, нормализуем amount к "X.XX".
     for t in data["transactions"]:
         if "id" not in t:
             t["id"] = str(uuid.uuid4())
@@ -148,37 +143,89 @@ def load_data() -> dict:
             t["account"] = "card"   # legacy default — большинство операций были по карте
         if "note" not in t:
             t["note"] = None
+        if "type" not in t:
+            t["type"] = "expense"   # подстраховка
         amt = t.get("amount", 0)
         try:
             t["amount"] = str(Decimal(str(amt)).quantize(Decimal("0.01"), ROUND_HALF_UP))
         except (InvalidOperation, ValueError):
             t["amount"] = "0.00"
 
+    # Запросы и переводы — id/amount нормализация на всякий случай
+    for r in data["requests"]:
+        if "id" not in r:
+            r["id"] = str(uuid.uuid4())
+        try:
+            r["amount"] = str(Decimal(str(r.get("amount", 0))).quantize(Decimal("0.01"), ROUND_HALF_UP))
+        except (InvalidOperation, ValueError):
+            r["amount"] = "0.00"
+    for t in data["transfers"]:
+        if "id" not in t:
+            t["id"] = str(uuid.uuid4())
+        try:
+            t["amount"] = str(Decimal(str(t.get("amount", 0))).quantize(Decimal("0.01"), ROUND_HALF_UP))
+        except (InvalidOperation, ValueError):
+            t["amount"] = "0.00"
+
     return data
 
 
-async def save_data(data: dict):
-    async with _lock:
-        dir_ = os.path.dirname(DATA_FILE) or "."
-        os.makedirs(dir_, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".budget_", suffix=".json")
+def load_data() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return _empty_data()
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        # Бэкап с таймстампом — чтобы не перетирать прошлые повреждения
+        ts = datetime.now(MOSCOW_TZ).strftime("%Y%m%d_%H%M%S")
+        backup = f"{DATA_FILE}.corrupt.{ts}"
+        logger.exception("Corrupted %s, backing up to %s", DATA_FILE, backup)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, DATA_FILE)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
+            os.rename(DATA_FILE, backup)
+        except OSError:
+            logger.exception("Failed to backup corrupt data file")
+        return _empty_data()
+    return _migrate(data)
+
+
+def _save_data_sync(data: dict):
+    """Синхронная атомарная запись через временный файл + os.replace.
+    НЕ берёт лок — для использования из под уже захваченного _lock."""
+    dir_ = os.path.dirname(DATA_FILE) or "."
+    os.makedirs(dir_, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".budget_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DATA_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+async def save_data(data: dict):
+    """Атомарная запись под глобальным локом."""
+    async with _lock:
+        await asyncio.to_thread(_save_data_sync, data)
+
+
+async def _atomic_modify(mutator):
+    """Атомарно: load → mutator(data) → save. Под одним локом —
+    защищает от гонок между конкурентными write-операциями."""
+    async with _lock:
+        data = await asyncio.to_thread(load_data)
+        mutator(data)
+        await asyncio.to_thread(_save_data_sync, data)
 
 
 async def _save_transaction(user_id: int, amount: Decimal, t_type: str,
                              account: str, category: str | None, note: str | None):
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
-    data = await asyncio.to_thread(load_data)
-    data["transactions"].append({
+    record = {
         "id":       str(uuid.uuid4()),
         "user_id":  user_id,
         "type":     t_type,        # "income" | "expense"
@@ -187,35 +234,33 @@ async def _save_transaction(user_id: int, amount: Decimal, t_type: str,
         "category": category,
         "note":     note,
         "date":     now,
-    })
-    await save_data(data)
+    }
+    await _atomic_modify(lambda data: data["transactions"].append(record))
 
 
 async def _save_request(user_id: int, amount: Decimal):
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
-    data = await asyncio.to_thread(load_data)
-    data["requests"].append({
+    record = {
         "id":      str(uuid.uuid4()),
         "user_id": user_id,
         "amount":  str(amount),
         "date":    now,
-    })
-    await save_data(data)
+    }
+    await _atomic_modify(lambda data: data["requests"].append(record))
 
 
 async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str):
     """src/dst: 'cash' или 'card'."""
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
-    data = await asyncio.to_thread(load_data)
-    data["transfers"].append({
+    record = {
         "id":      str(uuid.uuid4()),
         "user_id": user_id,
         "amount":  str(amount),
         "from":    src,
         "to":      dst,
         "date":    now,
-    })
-    await save_data(data)
+    }
+    await _atomic_modify(lambda data: data["transfers"].append(record))
 
 
 def parse_amount(s: str) -> Decimal:
@@ -258,19 +303,8 @@ def _strip_emoji(s) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции — inline-клавиатуры
+# Вспомогательные функции — клавиатуры
 # ---------------------------------------------------------------------------
-
-def _kb(rows: list[list[str]], prefix: str = "") -> InlineKeyboardMarkup:
-    """Строит InlineKeyboardMarkup из списка строк."""
-    buttons = []
-    for row in rows:
-        buttons.append([
-            InlineKeyboardButton(label, callback_data=f"{prefix}{label}")
-            for label in row
-        ])
-    return InlineKeyboardMarkup(buttons)
-
 
 def _reply_kb(options: list[str], add_free: bool = False, add_today: bool = False,
               cols: int = 2) -> ReplyKeyboardMarkup:
@@ -707,8 +741,10 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     def totals(account):
-        inc = sum(Decimal(t["amount"]) for t in txs if t["account"] == account and t["type"] == "income")
-        exp = sum(Decimal(t["amount"]) for t in txs if t["account"] == account and t["type"] == "expense")
+        inc = sum(Decimal(t["amount"]) for t in txs
+                  if t.get("account") == account and t.get("type") == "income")
+        exp = sum(Decimal(t["amount"]) for t in txs
+                  if t.get("account") == account and t.get("type") == "expense")
         return inc, exp
 
     cash_inc, cash_exp = totals("cash")
@@ -799,7 +835,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         acc  = t.get("account", "card")
         cat  = f" ({t['category']})" if t.get("category") else ""
         note = f" · {t['note']}" if t.get("note") else ""
-        if t["type"] == "income":
+        if t.get("type") == "income":
             line = f"➕ +{fmt(t['amount'])} ₽{cat}{note}  [{t['date']}]"
         else:
             line = f"➖ -{fmt(t['amount'])} ₽{cat}{note}  [{t['date']}]"
@@ -1277,20 +1313,35 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
         return EDIT_CHOOSE_FIELD
 
     if query.data == "edit_confirm_yes":
-        tx_id  = context.user_data.get("edit_tx_id")
-        is_req = context.user_data.get("edit_is_request", False)
-        data   = await asyncio.to_thread(load_data)
-        key    = "requests" if is_req else "transactions"
-        item   = next((x for x in data[key] if x["id"] == tx_id), None)
-        if item is None or item["user_id"] != update.effective_user.id:
+        tx_id   = context.user_data.get("edit_tx_id")
+        is_req  = context.user_data.get("edit_is_request", False)
+        user_id = update.effective_user.id
+        key     = "requests" if is_req else "transactions"
+
+        deleted_amount = [None]
+
+        def mutate(data):
+            item = next((x for x in data[key] if x.get("id") == tx_id), None)
+            if item is None or item.get("user_id") != user_id:
+                return
+            deleted_amount[0] = item["amount"]
+            data[key] = [x for x in data[key] if x.get("id") != tx_id]
+
+        try:
+            await _atomic_modify(mutate)
+        except OSError:
+            logger.exception("Failed to delete item")
+            await query.edit_message_text("⚠️ Не удалось удалить, попробуй ещё раз.")
+            return ConversationHandler.END
+
+        if deleted_amount[0] is None:
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
-        data[key] = [x for x in data[key] if x["id"] != tx_id]
-        await save_data(data)
+
         if is_req:
-            msg = f"🗑 Запрос {fmt(item['amount'])} ₽ удалён."
+            msg = f"🗑 Запрос {fmt(deleted_amount[0])} ₽ удалён."
         else:
-            msg = f"🗑 Операция {fmt(item['amount'])} ₽ удалена."
+            msg = f"🗑 Операция {fmt(deleted_amount[0])} ₽ удалена."
         await query.edit_message_text(msg)
         return ConversationHandler.END
 
@@ -1298,34 +1349,62 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    field  = context.user_data.get("edit_field")
-    tx_id  = context.user_data.get("edit_tx_id")
-    is_req = context.user_data.get("edit_is_request", False)
-    text   = (update.message.text or "").strip()
+    field   = context.user_data.get("edit_field")
+    tx_id   = context.user_data.get("edit_tx_id")
+    is_req  = context.user_data.get("edit_is_request", False)
+    text    = (update.message.text or "").strip()
+    user_id = update.effective_user.id
 
-    data = await asyncio.to_thread(load_data)
-    key  = "requests" if is_req else "transactions"
-    item = next((x for x in data[key] if x["id"] == tx_id), None)
-    if item is None or item["user_id"] != update.effective_user.id:
-        await update.message.reply_text("⛔ Операция недоступна.", reply_markup=MAIN_KEYBOARD)
-        return ConversationHandler.END
-
+    # Сначала валидируем ввод — без обращения к данным
     if field == "amount":
         try:
             new_val = parse_amount(text)
         except ValueError:
             await update.message.reply_text("❌ Введи корректную сумму:")
             return EDIT_ENTERING_VALUE
-        item["amount"] = str(new_val)
-        msg = f"✅ Сумма обновлена: {fmt(new_val)} ₽"
+        new_value = str(new_val)
     elif field == "category":
-        item["category"] = text[:MAX_NOTE_LEN]
-        msg = f"✅ Категория обновлена: {item['category']}"
+        if not text:
+            await update.message.reply_text("❌ Категория не может быть пустой:")
+            return EDIT_ENTERING_VALUE
+        new_value = text[:MAX_NOTE_LEN]
+    elif field == "note":
+        if not text:
+            await update.message.reply_text("❌ Примечание не может быть пустым:")
+            return EDIT_ENTERING_VALUE
+        new_value = text[:MAX_NOTE_LEN]
     else:
-        item["note"] = text[:MAX_NOTE_LEN]
-        msg = f"✅ Примечание обновлено: {item['note']}"
+        await update.message.reply_text("⛔ Неизвестное поле.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
 
-    await save_data(data)
+    key = "requests" if is_req else "transactions"
+    found = [False]
+
+    def mutate(data):
+        item = next((x for x in data[key] if x.get("id") == tx_id), None)
+        if item is None or item.get("user_id") != user_id:
+            return
+        item[field] = new_value
+        found[0] = True
+
+    try:
+        await _atomic_modify(mutate)
+    except OSError:
+        logger.exception("Failed to save edited value")
+        await update.message.reply_text("⚠️ Не удалось сохранить, попробуй ещё раз.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    if not found[0]:
+        await update.message.reply_text("⛔ Операция недоступна.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    if field == "amount":
+        msg = f"✅ Сумма обновлена: {fmt(new_value)} ₽"
+    elif field == "category":
+        msg = f"✅ Категория обновлена: {new_value}"
+    else:
+        msg = f"✅ Примечание обновлено: {new_value}"
+
     await update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -1345,12 +1424,19 @@ async def clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "clear_yes":
-        data    = await asyncio.to_thread(load_data)
         user_id = update.effective_user.id
-        data["transactions"] = [t for t in data["transactions"] if t["user_id"] != user_id]
-        data["requests"]     = [r for r in data["requests"]     if r["user_id"] != user_id]
-        data["transfers"]    = [t for t in data["transfers"]    if t["user_id"] != user_id]
-        await save_data(data)
+
+        def mutate(data):
+            data["transactions"] = [t for t in data["transactions"] if t.get("user_id") != user_id]
+            data["requests"]     = [r for r in data["requests"]     if r.get("user_id") != user_id]
+            data["transfers"]    = [t for t in data["transfers"]    if t.get("user_id") != user_id]
+
+        try:
+            await _atomic_modify(mutate)
+        except OSError:
+            logger.exception("Failed to clear user data")
+            await query.edit_message_text("⚠️ Не удалось очистить, попробуй ещё раз.")
+            return
         await query.edit_message_text("🗑 Все твои данные удалены.")
     else:
         await query.edit_message_text("Отменено.")
