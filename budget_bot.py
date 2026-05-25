@@ -490,6 +490,12 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Карта — списание: подкатегории
     if account == "card" and direction == "expense":
+        if context.user_data.pop("awaiting_subcategory", False):
+            context.user_data["note"] = text[:MAX_NOTE_LEN]
+            return await _finish(update, context,
+                                  category=context.user_data["category"],
+                                  note=context.user_data["note"])
+
         if text == CAT_BANK:
             context.user_data["category"] = text
             kb = _reply_kb(BANK_SUBCATEGORIES)
@@ -511,17 +517,10 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["awaiting_subcategory"] = True
             return ST_CHOOSE_CATEGORY
 
-        if context.user_data.pop("awaiting_subcategory", False):
-            context.user_data["note"] = text[:MAX_NOTE_LEN]
-            return await _finish(update, context,
-                                  category=context.user_data["category"],
-                                  note=context.user_data["note"])
-
         if text == CAT_ZP:
             context.user_data["category"] = text
             kb = _reply_kb([], add_dates=True)
             await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
-            context.user_data["awaiting_zp_date"] = True
             return ST_ENTERING_ZP_DATE
 
         if text in (CAT_OFC, CAT_WH):
@@ -544,7 +543,6 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["category"] = text
         kb = _reply_kb([], add_dates=True)
         await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
-        context.user_data["awaiting_zp_date"] = True
         return ST_ENTERING_ZP_DATE
 
     # Все остальные кнопки — сохраняем как категорию без доп. ввода
@@ -1294,7 +1292,7 @@ async def edit_field_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompts = {
             "amount":   "Введи новую сумму:",
             "category": "Введи новую категорию:",
-            "note":     "Введи новое примечание:",
+            "note":     "Введи новое примечание (или /skip для удаления):",
         }
         await query.edit_message_text(prompts.get(field, "Введи значение:"))
         return EDIT_ENTERING_VALUE
@@ -1371,15 +1369,18 @@ async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return EDIT_ENTERING_VALUE
         new_value = str(new_val)
     elif field == "category":
-        if not text:
+        if not text or text == "/skip":
             await update.message.reply_text("❌ Категория не может быть пустой:")
             return EDIT_ENTERING_VALUE
         new_value = text[:MAX_NOTE_LEN]
     elif field == "note":
-        if not text:
-            await update.message.reply_text("❌ Примечание не может быть пустым:")
+        if text == "/skip":
+            new_value = None
+        elif not text:
+            await update.message.reply_text("❌ Введи примечание (или /skip для удаления):")
             return EDIT_ENTERING_VALUE
-        new_value = text[:MAX_NOTE_LEN]
+        else:
+            new_value = text[:MAX_NOTE_LEN]
     else:
         await update.message.reply_text("⛔ Неизвестное поле.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
@@ -1409,6 +1410,8 @@ async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
         msg = f"✅ Сумма обновлена: {fmt(new_value)} ₽"
     elif field == "category":
         msg = f"✅ Категория обновлена: {new_value}"
+    elif new_value is None:
+        msg = "✅ Примечание удалено."
     else:
         msg = f"✅ Примечание обновлено: {new_value}"
 
@@ -1489,7 +1492,7 @@ def main():
             ST_ENTERING_AMOUNT:          [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount)],
             ST_CHOOSE_CATEGORY:          [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category)],
             ST_ENTERING_ZP_DATE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_zp_date)],
-            ST_ENTERING_NOTE:            [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note)],
+            ST_ENTERING_NOTE:            [CommandHandler("skip", handle_note), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note)],
             ST_ENTERING_REQUEST_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_request_amount)],
             ST_CHOOSE_TRANSFER_DIR:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_dir)],
             ST_ENTERING_TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_amount)],
@@ -1528,6 +1531,7 @@ def main():
                 CallbackQueryHandler(edit_confirm_delete, pattern="^edit_confirm_(yes|no)$"),
             ],
             EDIT_ENTERING_VALUE: [
+                CommandHandler("skip", edit_receive_value),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_value),
             ],
         },
