@@ -819,17 +819,20 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
         return
 
-    def totals(account):
+    def totals(account, bank=None):
+        """Поступления и списания по счёту; bank=None — все банки."""
         inc = sum(Decimal(t["amount"]) for t in txs
-                  if t.get("account") == account and t.get("type") == "income")
+                  if t.get("account") == account and t.get("type") == "income"
+                  and (bank is None or t.get("bank") == bank))
         exp = sum(Decimal(t["amount"]) for t in txs
-                  if t.get("account") == account and t.get("type") == "expense")
+                  if t.get("account") == account and t.get("type") == "expense"
+                  and (bank is None or t.get("bank") == bank))
         return inc, exp
 
     cash_inc, cash_exp = totals("cash")
     card_inc, card_exp = totals("card")
 
-    # Переводы: чистое движение по каждому счёту
+    # Переводы: чистое движение по каждому счёту (переводы не привязаны к банку)
     cash_tr_in  = sum(Decimal(t["amount"]) for t in trs if t["to"]   == "cash")
     cash_tr_out = sum(Decimal(t["amount"]) for t in trs if t["from"] == "cash")
     card_tr_in  = sum(Decimal(t["amount"]) for t in trs if t["to"]   == "card")
@@ -875,17 +878,48 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cash_tr_line = (f"  Переводы:    {_signed(cash_tr_net)} ₽\n" if trs else "")
     card_tr_line = (f"  Переводы:    {_signed(card_tr_net)} ₽\n" if trs else "")
 
+    # Разбивка карты по банкам (показываем только банки у которых есть операции)
+    bank_order = [(BANK_TINKOFF, "🟡 Тиньков"), (BANK_VTB, "🔵 ВТБ")]
+    card_bank_lines = ""
+    for bank_key, bank_name in bank_order:
+        b_inc, b_exp = totals("card", bank=bank_key)
+        if b_inc == 0 and b_exp == 0:
+            continue
+        b_bal = b_inc - b_exp
+        card_bank_lines += (
+            f"\n  {bank_name}\n"
+            f"    Поступления: {fmt(b_inc)} ₽\n"
+            f"    Списания:    {fmt(b_exp)} ₽\n"
+            f"    Баланс:      {fmt(b_bal)} ₽"
+        )
+
+    # Если банков больше одного — добавляем итоговую строку по картам
+    active_banks = sum(
+        1 for bk, _ in bank_order
+        if any(True for inc_exp in [totals("card", bank=bk)] for v in inc_exp if v > 0)
+    )
+    card_total_line = ""
+    if active_banks > 1:
+        card_total_line = (
+            f"\n  ──────────────────\n"
+            f"  Итого по картам\n"
+            f"    Поступления: {fmt(card_inc)} ₽\n"
+            f"    Списания:    {fmt(card_exp)} ₽\n"
+            f"{('    Переводы:    ' + _signed(card_tr_net) + ' ₽\n') if trs else ''}"
+            f"    Баланс:      {fmt(card_bal)} ₽"
+        )
+    else:
+        card_total_line = f"\n{card_tr_line}  Баланс:      {fmt(card_bal)} ₽"
+
     text = (
         f"💵 Наличные\n"
         f"  Поступления: {fmt(cash_inc)} ₽\n"
         f"  Списания:    {fmt(cash_exp)} ₽\n"
         f"{cash_tr_line}"
         f"  Баланс:      {fmt(cash_bal)} ₽\n\n"
-        f"💳 Карта\n"
-        f"  Поступления: {fmt(card_inc)} ₽\n"
-        f"  Списания:    {fmt(card_exp)} ₽\n"
-        f"{card_tr_line}"
-        f"  Баланс:      {fmt(card_bal)} ₽\n\n"
+        f"💳 Карта"
+        f"{card_bank_lines}"
+        f"{card_total_line}\n\n"
         f"{'✅' if total >= 0 else '⚠️'} Общий баланс: {fmt(total)} ₽"
         f"{req_lines}"
         f"{cat_lines}"
