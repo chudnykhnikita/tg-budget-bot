@@ -51,7 +51,8 @@ logger = logging.getLogger(__name__)
     ST_ENTERING_REQUEST_AMOUNT,   # ввод суммы запроса
     ST_CHOOSE_TRANSFER_DIR,       # выбор направления перевода (карта↔наличные)
     ST_ENTERING_TRANSFER_AMOUNT,  # ввод суммы перевода
-) = range(9)
+    ST_CHOOSE_BANK,               # выбор банка для карты / запроса
+) = range(10)
 
 (
     EDIT_CHOOSE_TYPE,       # выбор: Наличные / Карта / Запросы
@@ -60,7 +61,7 @@ logger = logging.getLogger(__name__)
     EDIT_CHOOSE_FIELD,      # выбор поля для редактирования или удаления
     EDIT_ENTERING_VALUE,    # ввод нового значения
     EDIT_CONFIRM_DELETE,    # подтверждение удаления
-) = range(9, 15)
+) = range(10, 16)
 
 EDIT_PAGE_SIZE = 5
 
@@ -106,6 +107,26 @@ BTN_YESTERDAY         = "📅 Вчера"
 BTN_BEFORE_YESTERDAY  = "📅 Позавчера"
 BTN_CANCEL            = "❌ Отмена"
 
+# Банки
+BANK_TINKOFF     = "tinkoff"
+BANK_VTB         = "vtb"
+BTN_BANK_TINKOFF = "🟡 Тиньков"
+BTN_BANK_VTB     = "🔵 ВТБ"
+BANK_BUTTONS     = [BTN_BANK_TINKOFF, BTN_BANK_VTB]
+BANK_LABELS      = {BANK_TINKOFF: "Тиньков", BANK_VTB: "ВТБ"}
+
+
+def _bank_from_btn(text: str) -> str | None:
+    if text == BTN_BANK_TINKOFF:
+        return BANK_TINKOFF
+    if text == BTN_BANK_VTB:
+        return BANK_VTB
+    return None
+
+
+def _bank_label(bank: str | None) -> str:
+    return BANK_LABELS.get(bank or "", "—")
+
 # ---------------------------------------------------------------------------
 # Главная клавиатура
 # ---------------------------------------------------------------------------
@@ -136,7 +157,7 @@ def _migrate(data: dict) -> dict:
     data.setdefault("requests", [])
     data.setdefault("transfers", [])
 
-    # Транзакции до cash/card-разделения: дополняем id/account/note,
+    # Транзакции до cash/card-разделения: дополняем id/account/note/bank,
     # подстраховываемся от отсутствующего type, нормализуем amount к "X.XX".
     for t in data["transactions"]:
         if "id" not in t:
@@ -147,6 +168,9 @@ def _migrate(data: dict) -> dict:
             t["note"] = None
         if "type" not in t:
             t["type"] = "expense"   # подстраховка
+        # Все старые карточные операции — Тиньков (ВТБ появился только 2026-05-27)
+        if "bank" not in t:
+            t["bank"] = BANK_TINKOFF if t.get("account") == "card" else None
         amt = t.get("amount", 0)
         try:
             t["amount"] = str(Decimal(str(amt)).quantize(Decimal("0.01"), ROUND_HALF_UP))
@@ -157,6 +181,9 @@ def _migrate(data: dict) -> dict:
     for r in data["requests"]:
         if "id" not in r:
             r["id"] = str(uuid.uuid4())
+        # Все старые запросы — Тиньков
+        if "bank" not in r:
+            r["bank"] = BANK_TINKOFF
         try:
             r["amount"] = str(Decimal(str(r.get("amount", 0))).quantize(Decimal("0.01"), ROUND_HALF_UP))
         except (InvalidOperation, ValueError):
@@ -225,7 +252,8 @@ async def _atomic_modify(mutator):
 
 
 async def _save_transaction(user_id: int, amount: Decimal, t_type: str,
-                             account: str, category: str | None, note: str | None):
+                             account: str, category: str | None, note: str | None,
+                             bank: str | None = None):
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
     record = {
         "id":       str(uuid.uuid4()),
@@ -235,17 +263,19 @@ async def _save_transaction(user_id: int, amount: Decimal, t_type: str,
         "amount":   str(amount),
         "category": category,
         "note":     note,
+        "bank":     bank,          # "tinkoff" | "vtb" | None (наличные)
         "date":     now,
     }
     await _atomic_modify(lambda data: data["transactions"].append(record))
 
 
-async def _save_request(user_id: int, amount: Decimal):
+async def _save_request(user_id: int, amount: Decimal, bank: str | None = None):
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
     record = {
         "id":      str(uuid.uuid4()),
         "user_id": user_id,
         "amount":  str(amount),
+        "bank":    bank,
         "date":    now,
     }
     await _atomic_modify(lambda data: data["requests"].append(record))
@@ -359,14 +389,13 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "История" in text:
         await history(update, context)
         return ConversationHandler.END
+
     if "Запросил" in text:
-        await update.message.reply_text(
-            "Введи запрошенную сумму:",
-            reply_markup=ReplyKeyboardMarkup(
-                [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
-            ),
-        )
-        return ST_ENTERING_REQUEST_AMOUNT
+        # Сначала выбираем банк, затем вводим сумму
+        context.user_data["flow"] = "request"
+        kb = _reply_kb(BANK_BUTTONS)
+        await update.message.reply_text("Через какой банк?", reply_markup=kb)
+        return ST_CHOOSE_BANK
 
     if "Перевод" in text:
         kb = ReplyKeyboardMarkup(
@@ -382,11 +411,50 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "Наличные" in text:
         context.user_data["account"] = "cash"
+        kb = ReplyKeyboardMarkup(
+            [["➕ Поступление", "➖ Списание"], [BTN_CANCEL]],
+            resize_keyboard=True, one_time_keyboard=True,
+        )
+        await update.message.reply_text("Поступление или списание?", reply_markup=kb)
+        return ST_CHOOSE_DIRECTION
     elif "Карта" in text:
         context.user_data["account"] = "card"
+        # Выбираем банк перед направлением операции
+        kb = _reply_kb(BANK_BUTTONS)
+        await update.message.reply_text("Через какой банк?", reply_markup=kb)
+        return ST_CHOOSE_BANK
     else:
         return ConversationHandler.END
 
+
+# ---------------------------------------------------------------------------
+# Шаг 1б — выбор банка (Тиньков / ВТБ)
+# ---------------------------------------------------------------------------
+
+async def handle_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if BTN_CANCEL in text:
+        return await cancel(update, context)
+
+    bank = _bank_from_btn(text)
+    if bank is None:
+        kb = _reply_kb(BANK_BUTTONS)
+        await update.message.reply_text("Выбери банк из предложенных:", reply_markup=kb)
+        return ST_CHOOSE_BANK
+
+    context.user_data["bank"] = bank
+
+    # Если это поток «Запросил» — переходим к вводу суммы запроса
+    if context.user_data.get("flow") == "request":
+        await update.message.reply_text(
+            "Введи запрошенную сумму:",
+            reply_markup=ReplyKeyboardMarkup(
+                [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+            ),
+        )
+        return ST_ENTERING_REQUEST_AMOUNT
+
+    # Иначе — поток «Карта», переходим к выбору направления
     kb = ReplyKeyboardMarkup(
         [["➕ Поступление", "➖ Списание"], [BTN_CANCEL]],
         resize_keyboard=True, one_time_keyboard=True,
@@ -588,6 +656,7 @@ async def _finish(update: Update, context: ContextTypes.DEFAULT_TYPE,
     amount    = Decimal(context.user_data["amount"])
     account   = context.user_data["account"]
     direction = context.user_data["direction"]
+    bank      = context.user_data.get("bank")  # None для наличных
 
     try:
         await _save_transaction(
@@ -597,6 +666,7 @@ async def _finish(update: Update, context: ContextTypes.DEFAULT_TYPE,
             account=account,
             category=category,
             note=note,
+            bank=bank,
         )
     except OSError:
         logger.exception("Failed to save transaction")
@@ -607,12 +677,13 @@ async def _finish(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return ConversationHandler.END
 
     acc_label  = "💵 Наличные" if account == "cash" else "💳 Карта"
+    bank_label = f" [{_bank_label(bank)}]" if bank else ""
     dir_label  = "Поступление" if direction == "income" else "Списание"
     cat_label  = f" · {category}" if category else ""
     note_label = f" · {note}" if note else ""
 
     await update.message.reply_text(
-        f"✅ {acc_label} | {dir_label} {fmt(amount)} ₽{cat_label}{note_label} сохранено!",
+        f"✅ {acc_label}{bank_label} | {dir_label} {fmt(amount)} ₽{cat_label}{note_label} сохранено!",
         reply_markup=MAIN_KEYBOARD,
     )
     context.user_data.clear()
@@ -634,8 +705,9 @@ async def handle_request_amount(update: Update, context: ContextTypes.DEFAULT_TY
         return ST_ENTERING_REQUEST_AMOUNT
 
     user_id = update.effective_user.id
+    bank    = context.user_data.get("bank")
     try:
-        await _save_request(user_id, amount)
+        await _save_request(user_id, amount, bank=bank)
     except OSError:
         logger.exception("Failed to save request")
         await update.message.reply_text(
@@ -655,13 +727,15 @@ async def handle_request_amount(update: Update, context: ContextTypes.DEFAULT_TY
     )
     remaining = total_req - total_card_in
 
+    bank_label = f" [{_bank_label(bank)}]" if bank else ""
     await update.message.reply_text(
-        f"✅ Запрошено {fmt(amount)} ₽\n\n"
+        f"✅ Запрошено{bank_label} {fmt(amount)} ₽\n\n"
         f"📨 Всего запрошено:  {fmt(total_req)} ₽\n"
         f"💳 Получено по карте: {fmt(total_card_in)} ₽\n"
         f"⏳ Осталось получить: {fmt(remaining)} ₽",
         reply_markup=MAIN_KEYBOARD,
     )
+    context.user_data.clear()
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -837,13 +911,14 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cash_lines, card_lines = [], []
     for t in txs[-20:][::-1]:
-        acc  = t.get("account", "card")
-        cat  = f" ({t['category']})" if t.get("category") else ""
-        note = f" · {t['note']}" if t.get("note") else ""
+        acc      = t.get("account", "card")
+        cat      = f" ({t['category']})" if t.get("category") else ""
+        note     = f" · {t['note']}" if t.get("note") else ""
+        bank_str = f" [{_bank_label(t.get('bank'))}]" if acc == "card" else ""
         if t.get("type") == "income":
-            line = f"➕ +{fmt(t['amount'])} ₽{cat}{note}  [{t['date']}]"
+            line = f"➕ +{fmt(t['amount'])} ₽{cat}{note}{bank_str}  [{t['date']}]"
         else:
-            line = f"➖ -{fmt(t['amount'])} ₽{cat}{note}  [{t['date']}]"
+            line = f"➖ -{fmt(t['amount'])} ₽{cat}{note}{bank_str}  [{t['date']}]"
         if acc == "cash":
             cash_lines.append(line)
         else:
@@ -887,7 +962,7 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cell.fill      = fill
         cell.alignment = Alignment(horizontal="center")
 
-    def build_sheet(ws, rows, cols, fill, has_note=False):
+    def build_sheet(ws, rows, cols, fill, has_note=False, extra_col_widths: dict | None = None):
         ws.append(cols)
         for i, col in enumerate(cols, 1):
             style_header(ws.cell(1, i), fill)
@@ -905,6 +980,9 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws.column_dimensions["C"].width = 25
         if has_note:
             ws.column_dimensions["D"].width = 25
+        if extra_col_widths:
+            for col_letter, width in extra_col_widths.items():
+                ws.column_dimensions[col_letter].width = width
 
     # Лист 1: Наличные — Поступления
     ws1 = wb.active
@@ -921,20 +999,24 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Лист 3: Карта — Поступления
     ws3 = wb.create_sheet("Карта Поступления")
-    rows = [[t["date"], float(t["amount"])]
+    rows = [[t["date"], float(t["amount"]), _bank_label(t.get("bank"))]
             for t in txs if t.get("account") == "card" and t["type"] == "income"]
-    build_sheet(ws3, rows, ["Дата", "Сумма (₽)"], income_fill)
+    build_sheet(ws3, rows, ["Дата", "Сумма (₽)", "Банк"], income_fill,
+                extra_col_widths={"C": 15})
 
     # Лист 4: Карта — Списания
     ws4 = wb.create_sheet("Карта Списания")
-    rows = [[t["date"], float(t["amount"]), _strip_emoji(t.get("category")), _strip_emoji(t.get("note"))]
+    rows = [[t["date"], float(t["amount"]), _strip_emoji(t.get("category")),
+             _strip_emoji(t.get("note")), _bank_label(t.get("bank"))]
             for t in txs if t.get("account") == "card" and t["type"] == "expense"]
-    build_sheet(ws4, rows, ["Дата", "Сумма (₽)", "Категория", "Примечание"], expense_fill, has_note=True)
+    build_sheet(ws4, rows, ["Дата", "Сумма (₽)", "Категория", "Примечание", "Банк"],
+                expense_fill, has_note=True, extra_col_widths={"E": 15})
 
     # Лист 5: Запросы (запрошено, получено по карте, осталось получить)
     ws5 = wb.create_sheet("Запросы")
-    req_rows = [[r["date"], float(r["amount"])] for r in reqs]
-    build_sheet(ws5, req_rows, ["Дата", "Запрошено (₽)"], request_fill)
+    req_rows = [[r["date"], float(r["amount"]), _bank_label(r.get("bank"))] for r in reqs]
+    build_sheet(ws5, req_rows, ["Дата", "Запрошено (₽)", "Банк"], request_fill,
+                extra_col_widths={"C": 15})
 
     total_card_in = sum(
         Decimal(t["amount"]) for t in txs
@@ -1108,6 +1190,7 @@ async def _edit_render_item(query, context, item: dict, is_request: bool):
         desc = (
             f"📨 Запрос\n"
             f"Сумма: {fmt(item['amount'])} ₽\n"
+            f"Банк: {_bank_label(item.get('bank'))}\n"
             f"Дата: {item['date']}"
         )
         buttons = [
@@ -1123,9 +1206,11 @@ async def _edit_render_item(query, context, item: dict, is_request: bool):
         d_type = "Поступление" if item["type"] == "income" else "Списание"
         cat    = item.get("category") or "—"
         note   = item.get("note") or "—"
+        bank_line = f"Банк: {_bank_label(item.get('bank'))}\n" if item.get("account") == "card" else ""
         desc = (
             f"{acc} | {d_type}\n"
             f"Сумма: {fmt(item['amount'])} ₽\n"
+            f"{bank_line}"
             f"Категория: {cat}\n"
             f"Примечание: {note}\n"
             f"Дата: {item['date']}"
@@ -1488,6 +1573,7 @@ def main():
     add_conv = ConversationHandler(
         entry_points=[MessageHandler(main_filter, handle_account)],
         states={
+            ST_CHOOSE_BANK:              [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bank)],
             ST_CHOOSE_DIRECTION:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direction)],
             ST_ENTERING_AMOUNT:          [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount)],
             ST_CHOOSE_CATEGORY:          [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category)],
