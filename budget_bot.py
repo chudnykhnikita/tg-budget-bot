@@ -191,6 +191,9 @@ def _migrate(data: dict) -> dict:
     for t in data["transfers"]:
         if "id" not in t:
             t["id"] = str(uuid.uuid4())
+        # Все старые переводы — Тиньков
+        if "bank" not in t:
+            t["bank"] = BANK_TINKOFF
         try:
             t["amount"] = str(Decimal(str(t.get("amount", 0))).quantize(Decimal("0.01"), ROUND_HALF_UP))
         except (InvalidOperation, ValueError):
@@ -281,8 +284,9 @@ async def _save_request(user_id: int, amount: Decimal, bank: str | None = None):
     await _atomic_modify(lambda data: data["requests"].append(record))
 
 
-async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str):
-    """src/dst: 'cash' или 'card'."""
+async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str,
+                          bank: str | None = None):
+    """src/dst: 'cash' или 'card'. bank — карточный банк перевода."""
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
     record = {
         "id":      str(uuid.uuid4()),
@@ -290,6 +294,7 @@ async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str):
         "amount":  str(amount),
         "from":    src,
         "to":      dst,
+        "bank":    bank,
         "date":    now,
     }
     await _atomic_modify(lambda data: data["transfers"].append(record))
@@ -443,9 +448,9 @@ async def handle_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_CHOOSE_BANK
 
     context.user_data["bank"] = bank
+    flow = context.user_data.get("flow")
 
-    # Если это поток «Запросил» — переходим к вводу суммы запроса
-    if context.user_data.get("flow") == "request":
+    if flow == "request":
         await update.message.reply_text(
             "Введи запрошенную сумму:",
             reply_markup=ReplyKeyboardMarkup(
@@ -454,7 +459,16 @@ async def handle_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ST_ENTERING_REQUEST_AMOUNT
 
-    # Иначе — поток «Карта», переходим к выбору направления
+    if flow == "transfer":
+        await update.message.reply_text(
+            "Введи сумму перевода:",
+            reply_markup=ReplyKeyboardMarkup(
+                [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+            ),
+        )
+        return ST_ENTERING_TRANSFER_AMOUNT
+
+    # По умолчанию — поток «Карта», переходим к выбору направления
     kb = ReplyKeyboardMarkup(
         [["➕ Поступление", "➖ Списание"], [BTN_CANCEL]],
         resize_keyboard=True, one_time_keyboard=True,
@@ -754,13 +768,11 @@ async def handle_transfer_dir(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         return ST_CHOOSE_TRANSFER_DIR
 
-    await update.message.reply_text(
-        "Введи сумму перевода:",
-        reply_markup=ReplyKeyboardMarkup(
-            [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
-        ),
-    )
-    return ST_ENTERING_TRANSFER_AMOUNT
+    # Выбираем банк карты перед вводом суммы
+    context.user_data["flow"] = "transfer"
+    kb = _reply_kb(BANK_BUTTONS)
+    await update.message.reply_text("Через какой банк?", reply_markup=kb)
+    return ST_CHOOSE_BANK
 
 
 async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -774,9 +786,10 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Введи корректную сумму (например: 5000 или 99.90)")
         return ST_ENTERING_TRANSFER_AMOUNT
 
-    tr  = context.user_data.get("transfer", {})
-    src = tr.get("from")
-    dst = tr.get("to")
+    tr   = context.user_data.get("transfer", {})
+    src  = tr.get("from")
+    dst  = tr.get("to")
+    bank = context.user_data.get("bank")
     if src not in ("cash", "card") or dst not in ("cash", "card") or src == dst:
         await update.message.reply_text(
             "⚠️ Что-то пошло не так с направлением. Попробуй ещё раз.",
@@ -786,7 +799,7 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
 
     user_id = update.effective_user.id
     try:
-        await _save_transfer(user_id, amount, src, dst)
+        await _save_transfer(user_id, amount, src, dst, bank=bank)
     except OSError:
         logger.exception("Failed to save transfer")
         await update.message.reply_text(
@@ -795,13 +808,14 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
         )
         return ConversationHandler.END
 
-    src_lbl = "💳 Карта" if src == "card" else "💵 Наличные"
-    dst_lbl = "💳 Карта" if dst == "card" else "💵 Наличные"
+    src_lbl  = "💳 Карта" if src == "card" else "💵 Наличные"
+    dst_lbl  = "💳 Карта" if dst == "card" else "💵 Наличные"
+    bank_lbl = f" [{_bank_label(bank)}]" if bank else ""
     await update.message.reply_text(
-        f"✅ Перевод {fmt(amount)} ₽\n{src_lbl} → {dst_lbl} сохранён.",
+        f"✅ Перевод {fmt(amount)} ₽\n{src_lbl}{bank_lbl} → {dst_lbl} сохранён.",
         reply_markup=MAIN_KEYBOARD,
     )
-    context.user_data.pop("transfer", None)
+    context.user_data.clear()
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -878,26 +892,31 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cash_tr_line = (f"  Переводы:    {_signed(cash_tr_net)} ₽\n" if trs else "")
     card_tr_line = (f"  Переводы:    {_signed(card_tr_net)} ₽\n" if trs else "")
 
-    # Разбивка карты по банкам (показываем только банки у которых есть операции)
+    # Разбивка карты по банкам (показываем только банки у которых есть операции/переводы)
     bank_order = [(BANK_TINKOFF, "🟡 Тиньков"), (BANK_VTB, "🔵 ВТБ")]
     card_bank_lines = ""
+    active_banks = 0
     for bank_key, bank_name in bank_order:
         b_inc, b_exp = totals("card", bank=bank_key)
-        if b_inc == 0 and b_exp == 0:
+        b_tr_in  = sum(Decimal(t["amount"]) for t in trs
+                       if t.get("to") == "card" and t.get("bank") == bank_key)
+        b_tr_out = sum(Decimal(t["amount"]) for t in trs
+                       if t.get("from") == "card" and t.get("bank") == bank_key)
+        b_tr_net = b_tr_in - b_tr_out
+        if b_inc == 0 and b_exp == 0 and b_tr_net == 0:
             continue
-        b_bal = b_inc - b_exp
+        active_banks += 1
+        b_bal     = b_inc - b_exp + b_tr_net
+        b_tr_line = (f"\n    Переводы:    {_signed(b_tr_net)} ₽" if b_tr_net != 0 else "")
         card_bank_lines += (
             f"\n  {bank_name}\n"
             f"    Поступления: {fmt(b_inc)} ₽\n"
-            f"    Списания:    {fmt(b_exp)} ₽\n"
+            f"    Списания:    {fmt(b_exp)} ₽"
+            f"{b_tr_line}\n"
             f"    Баланс:      {fmt(b_bal)} ₽"
         )
 
-    # Если банков больше одного — добавляем итоговую строку по картам
-    active_banks = sum(
-        1 for bk, _ in bank_order
-        if any(True for inc_exp in [totals("card", bank=bk)] for v in inc_exp if v > 0)
-    )
+    # Если активных банков больше одного — итоговая строка по всем картам
     card_total_line = ""
     if active_banks > 1:
         card_total_line = (
@@ -1079,8 +1098,10 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dst = "Карта" if t.get("to")   == "card" else "Наличные"
         return f"{src} → {dst}"
 
-    tr_rows = [[t["date"], float(t["amount"]), _dir_label(t)] for t in trs]
-    build_sheet(ws6, tr_rows, ["Дата", "Сумма (₽)", "Направление"], transfer_fill)
+    tr_rows = [[t["date"], float(t["amount"]), _dir_label(t), _bank_label(t.get("bank"))]
+               for t in trs]
+    build_sheet(ws6, tr_rows, ["Дата", "Сумма (₽)", "Направление", "Банк"], transfer_fill,
+                extra_col_widths={"D": 15})
 
     buf = BytesIO()
     wb.save(buf)
@@ -1098,9 +1119,15 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Вспомогательные функции для отрисовки экранов редактирования ---------
 
-def _edit_item_label(item: dict, is_request: bool) -> str:
+def _edit_item_label(item: dict, is_request: bool, is_transfer: bool = False) -> str:
     if is_request:
-        return f"📨 {fmt(item['amount'])} ₽   {item['date']}"
+        bank = f" [{_bank_label(item.get('bank'))}]" if item.get("bank") else ""
+        return f"📨 {fmt(item['amount'])} ₽{bank}   {item['date']}"
+    if is_transfer:
+        src  = "Карта" if item.get("from") == "card" else "Нал"
+        dst  = "Карта" if item.get("to")   == "card" else "Нал"
+        bank = f" [{_bank_label(item.get('bank'))}]" if item.get("bank") else ""
+        return f"🔄 {fmt(item['amount'])} ₽  {src}{bank}→{dst}   {item['date']}"
     sign = "➕" if item["type"] == "income" else "➖"
     cat  = f" · {item['category']}" if item.get("category") else ""
     note = f" · {item['note']}"     if item.get("note")     else ""
@@ -1109,7 +1136,9 @@ def _edit_item_label(item: dict, is_request: bool) -> str:
 
 def _edit_get_filtered(data: dict, user_id: int, flt: dict) -> list[dict]:
     if flt["type"] == "requests":
-        items = [r for r in data["requests"] if r["user_id"] == user_id]
+        items = [r for r in data["requests"]  if r["user_id"] == user_id]
+    elif flt["type"] == "transfers":
+        items = [t for t in data["transfers"] if t["user_id"] == user_id]
     else:
         account   = flt["type"]      # "cash" | "card"
         direction = flt["direction"] # "income" | "expense"
@@ -1126,10 +1155,11 @@ def _edit_get_filtered(data: dict, user_id: int, flt: dict) -> list[dict]:
 async def _edit_render_type_picker(target):
     """target — это update.message (на старте) или callback_query (после кликов)."""
     buttons = [
-        [InlineKeyboardButton("💵 Наличные", callback_data="edit_type:cash")],
-        [InlineKeyboardButton("💳 Карта",    callback_data="edit_type:card")],
-        [InlineKeyboardButton("📨 Запросы",  callback_data="edit_type:requests")],
-        [InlineKeyboardButton("❌ Отмена",   callback_data="edit_cancel")],
+        [InlineKeyboardButton("💵 Наличные",  callback_data="edit_type:cash")],
+        [InlineKeyboardButton("💳 Карта",     callback_data="edit_type:card")],
+        [InlineKeyboardButton("📨 Запросы",   callback_data="edit_type:requests")],
+        [InlineKeyboardButton("🔄 Переводы",  callback_data="edit_type:transfers")],
+        [InlineKeyboardButton("❌ Отмена",    callback_data="edit_cancel")],
     ]
     text = "Что редактируем?"
     kb   = InlineKeyboardMarkup(buttons)
@@ -1159,11 +1189,16 @@ async def _edit_render_list(query, context, user_id: int):
     flt  = context.user_data["edit_filter"]
     data = await asyncio.to_thread(load_data)
     items = _edit_get_filtered(data, user_id, flt)
-    is_request = flt["type"] == "requests"
+    is_request  = flt["type"] == "requests"
+    is_transfer = flt["type"] == "transfers"
+    # Запросы и переводы возвращают назад к выбору типа; остальные — к выбору направления
+    back_cb = "edit_back_type" if (is_request or is_transfer) else "edit_back_dir"
 
     # Заголовок
     if is_request:
         title = "📨 Запросы"
+    elif is_transfer:
+        title = "🔄 Переводы"
     else:
         acc  = "💵 Наличные" if flt["type"] == "cash" else "💳 Карта"
         dirn = "Поступления" if flt["direction"] == "income" else "Списания"
@@ -1171,10 +1206,7 @@ async def _edit_render_list(query, context, user_id: int):
 
     if not items:
         buttons = [[
-            InlineKeyboardButton(
-                "◀️ Назад",
-                callback_data="edit_back_type" if is_request else "edit_back_dir",
-            ),
+            InlineKeyboardButton("◀️ Назад",  callback_data=back_cb),
             InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
         ]]
         await query.edit_message_text(
@@ -1193,7 +1225,9 @@ async def _edit_render_list(query, context, user_id: int):
     buttons = []
     for it in page_items:
         cb = f"edit_sel:{it['id']}"
-        buttons.append([InlineKeyboardButton(_edit_item_label(it, is_request), callback_data=cb)])
+        buttons.append([InlineKeyboardButton(
+            _edit_item_label(it, is_request, is_transfer), callback_data=cb
+        )])
 
     # Навигация по страницам
     nav = []
@@ -1202,14 +1236,11 @@ async def _edit_render_list(query, context, user_id: int):
     nav.append(InlineKeyboardButton(f"стр. {page + 1}/{total_pages}", callback_data="edit_noop"))
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton("▶️", callback_data=f"edit_page:{page + 1}"))
-    if len(nav) > 1:  # не показываем единственную плашку без стрелок
+    if len(nav) > 1:
         buttons.append(nav)
 
     buttons.append([
-        InlineKeyboardButton(
-            "◀️ Назад",
-            callback_data="edit_back_type" if is_request else "edit_back_dir",
-        ),
+        InlineKeyboardButton("◀️ Назад",  callback_data=back_cb),
         InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
     ])
 
@@ -1219,8 +1250,27 @@ async def _edit_render_list(query, context, user_id: int):
     )
 
 
-async def _edit_render_item(query, context, item: dict, is_request: bool):
-    if is_request:
+async def _edit_render_item(query, context, item: dict,
+                             is_request: bool, is_transfer: bool = False):
+    if is_transfer:
+        src = "Карта" if item.get("from") == "card" else "Наличные"
+        dst = "Карта" if item.get("to")   == "card" else "Наличные"
+        desc = (
+            f"🔄 Перевод\n"
+            f"Сумма: {fmt(item['amount'])} ₽\n"
+            f"Банк: {_bank_label(item.get('bank'))}\n"
+            f"Направление: {src} → {dst}\n"
+            f"Дата: {item['date']}"
+        )
+        buttons = [
+            [InlineKeyboardButton("✏️ Сумму",  callback_data="edit_field:amount")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data="edit_delete")],
+            [
+                InlineKeyboardButton("◀️ Назад",  callback_data="edit_back_list"),
+                InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+            ],
+        ]
+    elif is_request:
         desc = (
             f"📨 Запрос\n"
             f"Сумма: {fmt(item['amount'])} ₽\n"
@@ -1262,8 +1312,15 @@ async def _edit_render_item(query, context, item: dict, is_request: bool):
     await query.edit_message_text(desc, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def _edit_render_delete_confirm(query, item: dict, is_request: bool):
-    if is_request:
+async def _edit_render_delete_confirm(query, item: dict,
+                                       is_request: bool, is_transfer: bool = False):
+    if is_transfer:
+        src  = "Карта" if item.get("from") == "card" else "Наличные"
+        dst  = "Карта" if item.get("to")   == "card" else "Наличные"
+        bank = f" [{_bank_label(item.get('bank'))}]" if item.get("bank") else ""
+        text = (f"Удалить перевод {fmt(item['amount'])} ₽  "
+                f"{src}{bank} → {dst}  от {item['date']}?")
+    elif is_request:
         text = f"Удалить запрос {fmt(item['amount'])} ₽ от {item['date']}?"
     else:
         sign = "+" if item["type"] == "income" else "−"
@@ -1280,10 +1337,11 @@ async def _edit_render_delete_confirm(query, item: dict, is_request: bool):
 
 async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Точка входа: команда /edit или кнопка «✏️ Изменить»."""
-    context.user_data.pop("edit_filter", None)
-    context.user_data.pop("edit_tx_id", None)
-    context.user_data.pop("edit_is_request", None)
-    context.user_data.pop("edit_field", None)
+    context.user_data.pop("edit_filter",      None)
+    context.user_data.pop("edit_tx_id",       None)
+    context.user_data.pop("edit_is_request",  None)
+    context.user_data.pop("edit_is_transfer", None)
+    context.user_data.pop("edit_field",       None)
     await _edit_render_type_picker(update.message)
     return EDIT_CHOOSE_TYPE
 
@@ -1299,10 +1357,10 @@ async def edit_pick_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query.data.startswith("edit_type:"):
         return EDIT_CHOOSE_TYPE
 
-    typ = query.data.split(":", 1)[1]   # "cash" | "card" | "requests"
+    typ = query.data.split(":", 1)[1]   # "cash" | "card" | "requests" | "transfers"
     context.user_data["edit_filter"] = {"type": typ, "page": 0}
 
-    if typ == "requests":
+    if typ in ("requests", "transfers"):
         await _edit_render_list(query, context, update.effective_user.id)
         return EDIT_LIST
 
@@ -1363,15 +1421,22 @@ async def edit_list_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item_id = query.data.split(":", 1)[1]
         flt     = context.user_data["edit_filter"]
         is_req  = flt["type"] == "requests"
+        is_tr   = flt["type"] == "transfers"
         data    = await asyncio.to_thread(load_data)
-        coll    = data["requests"] if is_req else data["transactions"]
-        item    = next((x for x in coll if x["id"] == item_id), None)
+        if is_req:
+            coll = data["requests"]
+        elif is_tr:
+            coll = data["transfers"]
+        else:
+            coll = data["transactions"]
+        item = next((x for x in coll if x["id"] == item_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
-        context.user_data["edit_tx_id"]      = item_id
-        context.user_data["edit_is_request"] = is_req
-        await _edit_render_item(query, context, item, is_req)
+        context.user_data["edit_tx_id"]       = item_id
+        context.user_data["edit_is_request"]  = is_req
+        context.user_data["edit_is_transfer"] = is_tr
+        await _edit_render_item(query, context, item, is_req, is_tr)
         return EDIT_CHOOSE_FIELD
 
     return EDIT_LIST
@@ -1392,20 +1457,27 @@ async def edit_field_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "edit_delete":
         tx_id  = context.user_data.get("edit_tx_id")
         is_req = context.user_data.get("edit_is_request", False)
+        is_tr  = context.user_data.get("edit_is_transfer", False)
         data   = await asyncio.to_thread(load_data)
-        coll   = data["requests"] if is_req else data["transactions"]
-        item   = next((x for x in coll if x["id"] == tx_id), None)
+        if is_req:
+            coll = data["requests"]
+        elif is_tr:
+            coll = data["transfers"]
+        else:
+            coll = data["transactions"]
+        item = next((x for x in coll if x["id"] == tx_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
-        await _edit_render_delete_confirm(query, item, is_req)
+        await _edit_render_delete_confirm(query, item, is_req, is_tr)
         return EDIT_CONFIRM_DELETE
 
     if query.data.startswith("edit_field:"):
         field  = query.data.split(":", 1)[1]
         is_req = context.user_data.get("edit_is_request", False)
-        # У запросов редактируется только сумма
-        if is_req and field != "amount":
+        is_tr  = context.user_data.get("edit_is_transfer", False)
+        # У запросов и переводов редактируется только сумма
+        if (is_req or is_tr) and field != "amount":
             return EDIT_CHOOSE_FIELD
         context.user_data["edit_field"] = field
         prompts = {
@@ -1427,20 +1499,32 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Возврат к карточке операции
         tx_id  = context.user_data.get("edit_tx_id")
         is_req = context.user_data.get("edit_is_request", False)
+        is_tr  = context.user_data.get("edit_is_transfer", False)
         data   = await asyncio.to_thread(load_data)
-        coll   = data["requests"] if is_req else data["transactions"]
-        item   = next((x for x in coll if x["id"] == tx_id), None)
+        if is_req:
+            coll = data["requests"]
+        elif is_tr:
+            coll = data["transfers"]
+        else:
+            coll = data["transactions"]
+        item = next((x for x in coll if x["id"] == tx_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
-        await _edit_render_item(query, context, item, is_req)
+        await _edit_render_item(query, context, item, is_req, is_tr)
         return EDIT_CHOOSE_FIELD
 
     if query.data == "edit_confirm_yes":
         tx_id   = context.user_data.get("edit_tx_id")
         is_req  = context.user_data.get("edit_is_request", False)
+        is_tr   = context.user_data.get("edit_is_transfer", False)
         user_id = update.effective_user.id
-        key     = "requests" if is_req else "transactions"
+        if is_req:
+            key = "requests"
+        elif is_tr:
+            key = "transfers"
+        else:
+            key = "transactions"
 
         deleted_amount = [None]
 
@@ -1462,7 +1546,9 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
 
-        if is_req:
+        if is_tr:
+            msg = f"🗑 Перевод {fmt(deleted_amount[0])} ₽ удалён."
+        elif is_req:
             msg = f"🗑 Запрос {fmt(deleted_amount[0])} ₽ удалён."
         else:
             msg = f"🗑 Операция {fmt(deleted_amount[0])} ₽ удалена."
@@ -1504,7 +1590,13 @@ async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⛔ Неизвестное поле.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
-    key = "requests" if is_req else "transactions"
+    is_tr = context.user_data.get("edit_is_transfer", False)
+    if is_req:
+        key = "requests"
+    elif is_tr:
+        key = "transfers"
+    else:
+        key = "transactions"
     found = [False]
 
     def mutate(data):
