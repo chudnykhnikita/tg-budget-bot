@@ -52,7 +52,8 @@ logger = logging.getLogger(__name__)
     ST_CHOOSE_TRANSFER_DIR,       # выбор направления перевода (карта↔наличные)
     ST_ENTERING_TRANSFER_AMOUNT,  # ввод суммы перевода
     ST_CHOOSE_BANK,               # выбор банка для карты / запроса
-) = range(10)
+    ST_CHOOSE_TRANSFER_BANK_TO,   # выбор банка-получателя при переводе карта→карта
+) = range(11)
 
 (
     EDIT_CHOOSE_TYPE,       # выбор: Наличные / Карта / Запросы
@@ -285,8 +286,8 @@ async def _save_request(user_id: int, amount: Decimal, bank: str | None = None):
 
 
 async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str,
-                          bank: str | None = None):
-    """src/dst: 'cash' или 'card'. bank — карточный банк перевода."""
+                          bank: str | None = None, bank_to: str | None = None):
+    """src/dst: 'cash' или 'card'. bank — банк-отправитель, bank_to — банк-получатель (карта→карта)."""
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
     record = {
         "id":      str(uuid.uuid4()),
@@ -295,6 +296,7 @@ async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str,
         "from":    src,
         "to":      dst,
         "bank":    bank,
+        "bank_to": bank_to,
         "date":    now,
     }
     await _atomic_modify(lambda data: data["transfers"].append(record))
@@ -407,6 +409,7 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 ["💳 → 💵  Карта → Наличные"],
                 ["💵 → 💳  Наличные → Карта"],
+                ["💳 → 💳  Карта → Карта"],
                 [BTN_CANCEL],
             ],
             resize_keyboard=True, one_time_keyboard=True,
@@ -460,6 +463,12 @@ async def handle_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_ENTERING_REQUEST_AMOUNT
 
     if flow == "transfer":
+        tr = context.user_data.get("transfer", {})
+        if tr.get("from") == "card" and tr.get("to") == "card":
+            # Карта→Карта: выбираем банк-получатель
+            kb = _reply_kb(BANK_BUTTONS)
+            await update.message.reply_text("Банк-получатель?", reply_markup=kb)
+            return ST_CHOOSE_TRANSFER_BANK_TO
         await update.message.reply_text(
             "Введи сумму перевода:",
             reply_markup=ReplyKeyboardMarkup(
@@ -765,14 +774,44 @@ async def handle_transfer_dir(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["transfer"] = {"from": "card", "to": "cash"}
     elif "Наличные → Карта" in text:
         context.user_data["transfer"] = {"from": "cash", "to": "card"}
+    elif "Карта → Карта" in text:
+        context.user_data["transfer"] = {"from": "card", "to": "card"}
     else:
         return ST_CHOOSE_TRANSFER_DIR
 
-    # Выбираем банк карты перед вводом суммы
     context.user_data["flow"] = "transfer"
     kb = _reply_kb(BANK_BUTTONS)
-    await update.message.reply_text("Через какой банк?", reply_markup=kb)
+    prompt = "Банк-отправитель?" if context.user_data["transfer"]["to"] == "card" and context.user_data["transfer"]["from"] == "card" else "Через какой банк?"
+    await update.message.reply_text(prompt, reply_markup=kb)
     return ST_CHOOSE_BANK
+
+
+async def handle_transfer_bank_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор банка-получателя при переводе карта→карта."""
+    text = (update.message.text or "").strip()
+    if BTN_CANCEL in text:
+        return await cancel(update, context)
+
+    bank_to = _bank_from_btn(text)
+    if bank_to is None:
+        kb = _reply_kb(BANK_BUTTONS)
+        await update.message.reply_text("Выбери банк из предложенных:", reply_markup=kb)
+        return ST_CHOOSE_TRANSFER_BANK_TO
+
+    bank_from = context.user_data.get("bank")
+    if bank_to == bank_from:
+        kb = _reply_kb(BANK_BUTTONS)
+        await update.message.reply_text("❌ Банк-получатель должен отличаться от отправителя:", reply_markup=kb)
+        return ST_CHOOSE_TRANSFER_BANK_TO
+
+    context.user_data["bank_to"] = bank_to
+    await update.message.reply_text(
+        "Введи сумму перевода:",
+        reply_markup=ReplyKeyboardMarkup(
+            [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+        ),
+    )
+    return ST_ENTERING_TRANSFER_AMOUNT
 
 
 async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -786,11 +825,12 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Введи корректную сумму (например: 5000 или 99.90)")
         return ST_ENTERING_TRANSFER_AMOUNT
 
-    tr   = context.user_data.get("transfer", {})
-    src  = tr.get("from")
-    dst  = tr.get("to")
-    bank = context.user_data.get("bank")
-    if src not in ("cash", "card") or dst not in ("cash", "card") or src == dst:
+    tr      = context.user_data.get("transfer", {})
+    src     = tr.get("from")
+    dst     = tr.get("to")
+    bank    = context.user_data.get("bank")
+    bank_to = context.user_data.get("bank_to")
+    if src not in ("cash", "card") or dst not in ("cash", "card"):
         await update.message.reply_text(
             "⚠️ Что-то пошло не так с направлением. Попробуй ещё раз.",
             reply_markup=MAIN_KEYBOARD,
@@ -799,7 +839,7 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
 
     user_id = update.effective_user.id
     try:
-        await _save_transfer(user_id, amount, src, dst, bank=bank)
+        await _save_transfer(user_id, amount, src, dst, bank=bank, bank_to=bank_to)
     except OSError:
         logger.exception("Failed to save transfer")
         await update.message.reply_text(
@@ -808,11 +848,12 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
         )
         return ConversationHandler.END
 
-    src_lbl  = "💳 Карта" if src == "card" else "💵 Наличные"
-    dst_lbl  = "💳 Карта" if dst == "card" else "💵 Наличные"
-    bank_lbl = f" [{_bank_label(bank)}]" if bank else ""
+    src_lbl      = "💳 Карта" if src == "card" else "💵 Наличные"
+    dst_lbl      = "💳 Карта" if dst == "card" else "💵 Наличные"
+    bank_from_lbl = f" [{_bank_label(bank)}]"    if bank    else ""
+    bank_to_lbl   = f" [{_bank_label(bank_to)}]" if bank_to else ""
     await update.message.reply_text(
-        f"✅ Перевод {fmt(amount)} ₽\n{src_lbl}{bank_lbl} → {dst_lbl} сохранён.",
+        f"✅ Перевод {fmt(amount)} ₽\n{src_lbl}{bank_from_lbl} → {dst_lbl}{bank_to_lbl} сохранён.",
         reply_markup=MAIN_KEYBOARD,
     )
     context.user_data.clear()
@@ -899,7 +940,10 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for bank_key, bank_name in bank_order:
         b_inc, b_exp = totals("card", bank=bank_key)
         b_tr_in  = sum(Decimal(t["amount"]) for t in trs
-                       if t.get("to") == "card" and t.get("bank") == bank_key)
+                       if t.get("to") == "card" and (
+                           t.get("bank_to") == bank_key if t.get("from") == "card"
+                           else t.get("bank") == bank_key
+                       ))
         b_tr_out = sum(Decimal(t["amount"]) for t in trs
                        if t.get("from") == "card" and t.get("bank") == bank_key)
         b_tr_net = b_tr_in - b_tr_out
@@ -1090,7 +1134,7 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws5[f"B{rem_r}"].font = Font(name="Arial", bold=True)
         ws5.column_dimensions["A"].width = 22
 
-    # Лист 6: Переводы (карта ↔ наличные)
+    # Лист 6: Переводы (карта ↔ наличные / карта ↔ карта)
     ws6 = wb.create_sheet("Переводы")
 
     def _dir_label(t: dict) -> str:
@@ -1098,10 +1142,18 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dst = "Карта" if t.get("to")   == "card" else "Наличные"
         return f"{src} → {dst}"
 
-    tr_rows = [[t["date"], float(t["amount"]), _dir_label(t), _bank_label(t.get("bank"))]
-               for t in trs]
-    build_sheet(ws6, tr_rows, ["Дата", "Сумма (₽)", "Направление", "Банк"], transfer_fill,
-                extra_col_widths={"D": 15})
+    tr_rows = [
+        [
+            t["date"],
+            float(t["amount"]),
+            _dir_label(t),
+            _bank_label(t.get("bank")),
+            _bank_label(t.get("bank_to")) if t.get("bank_to") else "",
+        ]
+        for t in trs
+    ]
+    build_sheet(ws6, tr_rows, ["Дата", "Сумма (₽)", "Направление", "Банк отправителя", "Банк получателя"],
+                transfer_fill, extra_col_widths={"D": 18, "E": 18})
 
     buf = BytesIO()
     wb.save(buf)
@@ -1124,8 +1176,12 @@ def _edit_item_label(item: dict, is_request: bool, is_transfer: bool = False) ->
         bank = f" [{_bank_label(item.get('bank'))}]" if item.get("bank") else ""
         return f"📨 {fmt(item['amount'])} ₽{bank}   {item['date']}"
     if is_transfer:
-        src  = "Карта" if item.get("from") == "card" else "Нал"
-        dst  = "Карта" if item.get("to")   == "card" else "Нал"
+        src = "Карта" if item.get("from") == "card" else "Нал"
+        dst = "Карта" if item.get("to")   == "card" else "Нал"
+        if item.get("from") == "card" and item.get("to") == "card":
+            bank_from = f" [{_bank_label(item.get('bank'))}]"    if item.get("bank")    else ""
+            bank_dst  = f" [{_bank_label(item.get('bank_to'))}]" if item.get("bank_to") else ""
+            return f"🔄 {fmt(item['amount'])} ₽  {src}{bank_from}→{dst}{bank_dst}   {item['date']}"
         bank = f" [{_bank_label(item.get('bank'))}]" if item.get("bank") else ""
         return f"🔄 {fmt(item['amount'])} ₽  {src}{bank}→{dst}   {item['date']}"
     sign = "➕" if item["type"] == "income" else "➖"
@@ -1255,10 +1311,17 @@ async def _edit_render_item(query, context, item: dict,
     if is_transfer:
         src = "Карта" if item.get("from") == "card" else "Наличные"
         dst = "Карта" if item.get("to")   == "card" else "Наличные"
+        if item.get("from") == "card" and item.get("to") == "card":
+            bank_line = (
+                f"Банк-отправитель: {_bank_label(item.get('bank'))}\n"
+                f"Банк-получатель: {_bank_label(item.get('bank_to'))}\n"
+            )
+        else:
+            bank_line = f"Банк: {_bank_label(item.get('bank'))}\n"
         desc = (
             f"🔄 Перевод\n"
             f"Сумма: {fmt(item['amount'])} ₽\n"
-            f"Банк: {_bank_label(item.get('bank'))}\n"
+            f"{bank_line}"
             f"Направление: {src} → {dst}\n"
             f"Дата: {item['date']}"
         )
@@ -1315,11 +1378,17 @@ async def _edit_render_item(query, context, item: dict,
 async def _edit_render_delete_confirm(query, item: dict,
                                        is_request: bool, is_transfer: bool = False):
     if is_transfer:
-        src  = "Карта" if item.get("from") == "card" else "Наличные"
-        dst  = "Карта" if item.get("to")   == "card" else "Наличные"
-        bank = f" [{_bank_label(item.get('bank'))}]" if item.get("bank") else ""
-        text = (f"Удалить перевод {fmt(item['amount'])} ₽  "
-                f"{src}{bank} → {dst}  от {item['date']}?")
+        src = "Карта" if item.get("from") == "card" else "Наличные"
+        dst = "Карта" if item.get("to")   == "card" else "Наличные"
+        if item.get("from") == "card" and item.get("to") == "card":
+            bank_from = f" [{_bank_label(item.get('bank'))}]"    if item.get("bank")    else ""
+            bank_dst  = f" [{_bank_label(item.get('bank_to'))}]" if item.get("bank_to") else ""
+            text = (f"Удалить перевод {fmt(item['amount'])} ₽  "
+                    f"{src}{bank_from} → {dst}{bank_dst}  от {item['date']}?")
+        else:
+            bank = f" [{_bank_label(item.get('bank'))}]" if item.get("bank") else ""
+            text = (f"Удалить перевод {fmt(item['amount'])} ₽  "
+                    f"{src}{bank} → {dst}  от {item['date']}?")
     elif is_request:
         text = f"Удалить запрос {fmt(item['amount'])} ₽ от {item['date']}?"
     else:
@@ -1707,6 +1776,7 @@ def main():
             ST_ENTERING_NOTE:            [CommandHandler("skip", handle_note), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note)],
             ST_ENTERING_REQUEST_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_request_amount)],
             ST_CHOOSE_TRANSFER_DIR:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_dir)],
+            ST_CHOOSE_TRANSFER_BANK_TO:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_bank_to)],
             ST_ENTERING_TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_amount)],
         },
         fallbacks=[
