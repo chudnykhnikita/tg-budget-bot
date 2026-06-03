@@ -398,11 +398,14 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if "Запросил" in text:
-        # Сначала выбираем банк, затем вводим сумму
         context.user_data["flow"] = "request"
-        kb = _reply_kb(BANK_BUTTONS)
-        await update.message.reply_text("Через какой банк?", reply_markup=kb)
-        return ST_CHOOSE_BANK
+        await update.message.reply_text(
+            "Введи запрошенную сумму:",
+            reply_markup=ReplyKeyboardMarkup(
+                [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+            ),
+        )
+        return ST_ENTERING_REQUEST_AMOUNT
 
     if "Перевод" in text:
         kb = ReplyKeyboardMarkup(
@@ -452,15 +455,6 @@ async def handle_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["bank"] = bank
     flow = context.user_data.get("flow")
-
-    if flow == "request":
-        await update.message.reply_text(
-            "Введи запрошенную сумму:",
-            reply_markup=ReplyKeyboardMarkup(
-                [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
-            ),
-        )
-        return ST_ENTERING_REQUEST_AMOUNT
 
     if flow == "transfer":
         tr = context.user_data.get("transfer", {})
@@ -728,9 +722,8 @@ async def handle_request_amount(update: Update, context: ContextTypes.DEFAULT_TY
         return ST_ENTERING_REQUEST_AMOUNT
 
     user_id = update.effective_user.id
-    bank    = context.user_data.get("bank")
     try:
-        await _save_request(user_id, amount, bank=bank)
+        await _save_request(user_id, amount)
     except OSError:
         logger.exception("Failed to save request")
         await update.message.reply_text(
