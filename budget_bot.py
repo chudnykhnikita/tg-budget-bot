@@ -87,8 +87,10 @@ CAT_SALE  = "🛒 Продажа со склада"
 SUB_BANK_SERVICE = "🧾 Обслуживание счёта"
 SUB_BANK_FEE     = "💸 Комиссия"
 
+CAT_COMP = "↩️ Компенсация клиенту за брак"
+
 # Категории карты — списания
-CARD_EXPENSE_CATEGORIES = [CAT_BANK, CAT_ZP, CAT_ZP_WORKERS, CAT_DIV, CAT_MEAL, CAT_OFC, CAT_WH]
+CARD_EXPENSE_CATEGORIES = [CAT_BANK, CAT_ZP, CAT_ZP_WORKERS, CAT_DIV, CAT_MEAL, CAT_OFC, CAT_WH, CAT_COMP]
 # Подкатегории «Плата банку»
 BANK_SUBCATEGORIES = [SUB_BANK_SERVICE, SUB_BANK_FEE]
 # Подкатегории «Дивиденды» (имена без эмодзи)
@@ -430,10 +432,13 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_CHOOSE_DIRECTION
     elif "Карта" in text:
         context.user_data["account"] = "card"
-        # Выбираем банк перед направлением операции
-        kb = _reply_kb(BANK_BUTTONS)
-        await update.message.reply_text("Через какой банк?", reply_markup=kb)
-        return ST_CHOOSE_BANK
+        context.user_data["bank"] = BANK_TINKOFF
+        kb = ReplyKeyboardMarkup(
+            [["➕ Поступление", "➖ Списание"], [BTN_CANCEL]],
+            resize_keyboard=True, one_time_keyboard=True,
+        )
+        await update.message.reply_text("Поступление или списание?", reply_markup=kb)
+        return ST_CHOOSE_DIRECTION
     else:
         return ConversationHandler.END
 
@@ -744,9 +749,8 @@ async def handle_request_amount(update: Update, context: ContextTypes.DEFAULT_TY
     )
     remaining = total_req - total_card_in
 
-    bank_label = f" [{_bank_label(bank)}]" if bank else ""
     await update.message.reply_text(
-        f"✅ Запрошено{bank_label} {fmt(amount)} ₽\n\n"
+        f"✅ Запрошено {fmt(amount)} ₽\n\n"
         f"📨 Всего запрошено:  {fmt(total_req)} ₽\n"
         f"💳 Получено по карте: {fmt(total_card_in)} ₽\n"
         f"⏳ Осталось получить: {fmt(remaining)} ₽",
@@ -775,10 +779,16 @@ async def handle_transfer_dir(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ST_CHOOSE_TRANSFER_DIR
 
     context.user_data["flow"] = "transfer"
-    kb = _reply_kb(BANK_BUTTONS)
-    prompt = "Банк-отправитель?" if context.user_data["transfer"]["to"] == "card" and context.user_data["transfer"]["from"] == "card" else "Через какой банк?"
-    await update.message.reply_text(prompt, reply_markup=kb)
-    return ST_CHOOSE_BANK
+    context.user_data["bank"] = BANK_TINKOFF
+    if context.user_data["transfer"]["from"] == "card" and context.user_data["transfer"]["to"] == "card":
+        context.user_data["bank_to"] = BANK_TINKOFF
+    await update.message.reply_text(
+        "Введи сумму перевода:",
+        reply_markup=ReplyKeyboardMarkup(
+            [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+        ),
+    )
+    return ST_ENTERING_TRANSFER_AMOUNT
 
 
 async def handle_transfer_bank_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -956,7 +966,9 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"    Баланс:      {fmt(b_bal)} ₽"
         )
 
-    # Если активных банков больше одного — итоговая строка по всем картам
+    # Если активных банков больше одного — показываем разбивку и итого
+    if active_banks <= 1:
+        card_bank_lines = ""
     card_total_line = ""
     if active_banks > 1:
         card_total_line = (
@@ -968,7 +980,12 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"    Баланс:      {fmt(card_bal)} ₽"
         )
     else:
-        card_total_line = f"\n{card_tr_line}  Баланс:      {fmt(card_bal)} ₽"
+        card_total_line = (
+            f"\n  Поступления: {fmt(card_inc)} ₽\n"
+            f"  Списания:    {fmt(card_exp)} ₽\n"
+            f"{card_tr_line}"
+            f"  Баланс:      {fmt(card_bal)} ₽"
+        )
 
     text = (
         f"💵 Наличные\n"
