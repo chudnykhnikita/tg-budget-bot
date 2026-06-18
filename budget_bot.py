@@ -1783,6 +1783,7 @@ def main():
             CommandHandler("edit", edit_start),
             MessageHandler(filters.Regex("^✏️ Изменить$"), edit_start),
         ],
+        allow_reentry=True,
         states={
             EDIT_CHOOSE_TYPE: [
                 CallbackQueryHandler(edit_pick_type, pattern="^(edit_type:|edit_cancel$)"),
