@@ -704,6 +704,7 @@ async def _finish(update: Update, context: ContextTypes.DEFAULT_TYPE,
         reply_markup=MAIN_KEYBOARD,
     )
     context.user_data.clear()
+    await show_summary(update, context)
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -752,6 +753,7 @@ async def handle_request_amount(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=MAIN_KEYBOARD,
     )
     context.user_data.clear()
+    await show_summary(update, context)
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -850,6 +852,7 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=MAIN_KEYBOARD,
     )
     context.user_data.clear()
+    await show_summary(update, context)
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
