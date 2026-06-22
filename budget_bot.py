@@ -1779,7 +1779,10 @@ def main():
     )
 
     add_conv = ConversationHandler(
-        entry_points=[MessageHandler(main_filter, handle_account)],
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(main_filter, handle_account),
+        ],
         states={
             ST_CHOOSE_BANK:              [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bank)],
             ST_CHOOSE_DIRECTION:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direction)],
@@ -1837,7 +1840,6 @@ def main():
         ],
     )
 
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("export", export_excel))
     app.add_handler(CommandHandler("clear",  clear))
     app.add_handler(CallbackQueryHandler(clear_confirm, pattern="^clear_"))
