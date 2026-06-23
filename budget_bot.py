@@ -1004,7 +1004,10 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
     # Сразу отправляем Excel
-    await export_excel(update, context)
+    try:
+        await export_excel(update, context)
+    except Exception as e:
+        logger.warning("export_excel failed: %s", e)
 
 # ---------------------------------------------------------------------------
 # История
@@ -1176,6 +1179,8 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         document=buf,
         filename=f"budget_{now}.xlsx",
         caption="📊 Готово!",
+        write_timeout=60,
+        read_timeout=30,
     )
 
 # ---------------------------------------------------------------------------
