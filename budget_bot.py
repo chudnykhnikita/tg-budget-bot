@@ -178,7 +178,7 @@ def _migrate(data: dict) -> dict:
         # Все старые карточные операции — Тиньков (ВТБ появился только 2026-05-27)
         if "bank" not in t:
             t["bank"] = BANK_TINKOFF if t.get("account") == "card" else None
-        amt = t.get("amount", 0)
+        amt = t.get("amount") or 0  # handles None and missing
         try:
             t["amount"] = str(Decimal(str(amt)).quantize(Decimal("0.01"), ROUND_HALF_UP))
         except (InvalidOperation, ValueError):
@@ -192,7 +192,7 @@ def _migrate(data: dict) -> dict:
         if "bank" not in r:
             r["bank"] = BANK_TINKOFF
         try:
-            r["amount"] = str(Decimal(str(r.get("amount", 0))).quantize(Decimal("0.01"), ROUND_HALF_UP))
+            r["amount"] = str(Decimal(str(r.get("amount") or 0)).quantize(Decimal("0.01"), ROUND_HALF_UP))
         except (InvalidOperation, ValueError):
             r["amount"] = "0.00"
     for t in data["transfers"]:
@@ -202,7 +202,7 @@ def _migrate(data: dict) -> dict:
         if "bank" not in t:
             t["bank"] = BANK_TINKOFF
         try:
-            t["amount"] = str(Decimal(str(t.get("amount", 0))).quantize(Decimal("0.01"), ROUND_HALF_UP))
+            t["amount"] = str(Decimal(str(t.get("amount") or 0)).quantize(Decimal("0.01"), ROUND_HALF_UP))
         except (InvalidOperation, ValueError):
             t["amount"] = "0.00"
 
@@ -255,8 +255,8 @@ def _make_daily_backup(data: dict, dir_: str):
         today = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
         backup_path = os.path.join(backup_dir, f"budget_data_{today}.json")
         if not os.path.exists(backup_path):
-            fd, tmp = tempfile.mkstemp(dir=backup_dir, prefix=".bak_", suffix=".json")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            tmp = backup_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, backup_path)
             # Удаляем бэкапы старше 30 дней
@@ -333,7 +333,8 @@ async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str,
 
 def parse_amount(s: str) -> Decimal:
     try:
-        v = Decimal(s.strip().replace(",", ".")).quantize(Decimal("0.01"), ROUND_HALF_UP)
+        cleaned = s.strip().replace(",", ".").replace(" ", "").replace(" ", "")
+        v = Decimal(cleaned).quantize(Decimal("0.01"), ROUND_HALF_UP)
     except InvalidOperation:
         raise ValueError
     if v <= 0:
@@ -368,6 +369,15 @@ def _strip_emoji(s) -> str:
     if not s:
         return ""
     return _EMOJI_RE.sub("", s).strip()
+
+
+# Стили для Excel — создаются один раз при старте
+_EXCEL_HEADER_FONT   = Font(name="Arial", bold=True, color="FFFFFF")
+_EXCEL_BOLD_FONT     = Font(name="Arial", bold=True)
+_EXCEL_INCOME_FILL   = PatternFill("solid", start_color="1E7E34")
+_EXCEL_EXPENSE_FILL  = PatternFill("solid", start_color="C0392B")
+_EXCEL_REQUEST_FILL  = PatternFill("solid", start_color="2980B9")
+_EXCEL_TRANSFER_FILL = PatternFill("solid", start_color="6C3483")
 
 
 # ---------------------------------------------------------------------------
@@ -700,7 +710,7 @@ async def handle_zp_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("category", None)
         return await _go_to_category(update, context)
 
-    today = date.today()
+    today = datetime.now(MOSCOW_TZ).date()
     if text == BTN_TODAY:
         note = today.strftime("%d.%m.%Y")
     elif text == BTN_YESTERDAY:
@@ -1075,9 +1085,9 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
-    # Сразу отправляем Excel
+    # Сразу отправляем Excel (данные уже загружены — не перечитываем файл)
     try:
-        await export_excel(update, context)
+        await export_excel(update, context, _data=data)
     except Exception as e:
         logger.warning("export_excel failed: %s", e)
 
@@ -1124,26 +1134,23 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Экспорт Excel (5 листов: Наличные поступления/списания, Карта поступления/списания, Запросы)
 # ---------------------------------------------------------------------------
 
-async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data    = await asyncio.to_thread(load_data)
+async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       _data: dict | None = None):
+    if _data is None:
+        _data = await asyncio.to_thread(load_data)
     user_id = update.effective_user.id
-    txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
-    reqs    = [r for r in data["requests"]     if r["user_id"] == user_id]
-    trs     = [t for t in data["transfers"]    if t["user_id"] == user_id]
+    txs     = [t for t in _data["transactions"] if t["user_id"] == user_id]
+    reqs    = [r for r in _data["requests"]     if r["user_id"] == user_id]
+    trs     = [t for t in _data["transfers"]    if t["user_id"] == user_id]
 
     if not txs and not reqs and not trs:
         await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
         return
 
     wb = Workbook()
-    header_font    = Font(name="Arial", bold=True, color="FFFFFF")
-    income_fill    = PatternFill("solid", start_color="1E7E34")
-    expense_fill   = PatternFill("solid", start_color="C0392B")
-    request_fill   = PatternFill("solid", start_color="2980B9")
-    transfer_fill  = PatternFill("solid", start_color="6C3483")
 
     def style_header(cell, fill):
-        cell.font      = header_font
+        cell.font      = _EXCEL_HEADER_FONT
         cell.fill      = fill
         cell.alignment = Alignment(horizontal="center")
 
@@ -1156,10 +1163,10 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rows:
             r = len(rows) + 2
             ws[f"A{r}"] = "Итого"
-            ws[f"A{r}"].font = Font(name="Arial", bold=True)
+            ws[f"A{r}"].font = _EXCEL_BOLD_FONT
             amount_col = "B"
             ws[f"{amount_col}{r}"] = f"=SUM({amount_col}2:{amount_col}{r-1})"
-            ws[f"{amount_col}{r}"].font = Font(name="Arial", bold=True)
+            ws[f"{amount_col}{r}"].font = _EXCEL_BOLD_FONT
         ws.column_dimensions["A"].width = 18
         ws.column_dimensions["B"].width = 15
         ws.column_dimensions["C"].width = 25
@@ -1174,19 +1181,19 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ws1.title = "Наличные Поступления"
     rows = [[t["date"], float(t["amount"]), _strip_emoji(t.get("category"))]
             for t in txs if t.get("account") == "cash" and t["type"] == "income"]
-    build_sheet(ws1, rows, ["Дата", "Сумма (₽)", "Категория"], income_fill)
+    build_sheet(ws1, rows, ["Дата", "Сумма (₽)", "Категория"], _EXCEL_INCOME_FILL)
 
     # Лист 2: Наличные — Списания
     ws2 = wb.create_sheet("Наличные Списания")
     rows = [[t["date"], float(t["amount"]), _strip_emoji(t.get("category")), _strip_emoji(t.get("note"))]
             for t in txs if t.get("account") == "cash" and t["type"] == "expense"]
-    build_sheet(ws2, rows, ["Дата", "Сумма (₽)", "Категория", "Примечание"], expense_fill, has_note=True)
+    build_sheet(ws2, rows, ["Дата", "Сумма (₽)", "Категория", "Примечание"], _EXCEL_EXPENSE_FILL, has_note=True)
 
     # Лист 3: Карта — Поступления
     ws3 = wb.create_sheet("Карта Поступления")
     rows = [[t["date"], float(t["amount"]), _bank_label(t.get("bank"))]
             for t in txs if t.get("account") == "card" and t["type"] == "income"]
-    build_sheet(ws3, rows, ["Дата", "Сумма (₽)", "Банк"], income_fill,
+    build_sheet(ws3, rows, ["Дата", "Сумма (₽)", "Банк"], _EXCEL_INCOME_FILL,
                 extra_col_widths={"C": 15})
 
     # Лист 4: Карта — Списания
@@ -1195,12 +1202,12 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
              _strip_emoji(t.get("note")), _bank_label(t.get("bank"))]
             for t in txs if t.get("account") == "card" and t["type"] == "expense"]
     build_sheet(ws4, rows, ["Дата", "Сумма (₽)", "Категория", "Примечание", "Банк"],
-                expense_fill, has_note=True, extra_col_widths={"E": 15})
+                _EXCEL_EXPENSE_FILL, has_note=True, extra_col_widths={"E": 15})
 
     # Лист 5: Запросы (запрошено, получено по карте, осталось получить)
     ws5 = wb.create_sheet("Запросы")
     req_rows = [[r["date"], float(r["amount"]), _bank_label(r.get("bank"))] for r in reqs]
-    build_sheet(ws5, req_rows, ["Дата", "Запрошено (₽)", "Банк"], request_fill,
+    build_sheet(ws5, req_rows, ["Дата", "Запрошено (₽)", "Банк"], _EXCEL_REQUEST_FILL,
                 extra_col_widths={"C": 15})
 
     total_card_in = sum(
@@ -1213,13 +1220,13 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rec_r   = total_r + 2
         rem_r   = total_r + 3
         ws5[f"A{rec_r}"] = "Получено по карте"
-        ws5[f"A{rec_r}"].font = Font(name="Arial", bold=True)
+        ws5[f"A{rec_r}"].font = _EXCEL_BOLD_FONT
         ws5[f"B{rec_r}"] = float(total_card_in)
-        ws5[f"B{rec_r}"].font = Font(name="Arial", bold=True)
+        ws5[f"B{rec_r}"].font = _EXCEL_BOLD_FONT
         ws5[f"A{rem_r}"] = "Осталось получить"
-        ws5[f"A{rem_r}"].font = Font(name="Arial", bold=True)
+        ws5[f"A{rem_r}"].font = _EXCEL_BOLD_FONT
         ws5[f"B{rem_r}"] = f"=B{total_r}-B{rec_r}"
-        ws5[f"B{rem_r}"].font = Font(name="Arial", bold=True)
+        ws5[f"B{rem_r}"].font = _EXCEL_BOLD_FONT
         ws5.column_dimensions["A"].width = 22
 
     # Лист 6: Переводы (карта ↔ наличные / карта ↔ карта)
@@ -1241,7 +1248,7 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for t in trs
     ]
     build_sheet(ws6, tr_rows, ["Дата", "Сумма (₽)", "Направление", "Банк отправителя", "Банк получателя"],
-                transfer_fill, extra_col_widths={"D": 18, "E": 18})
+                _EXCEL_TRANSFER_FILL, extra_col_widths={"D": 18, "E": 18})
 
     buf = BytesIO()
     wb.save(buf)
@@ -1258,6 +1265,14 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Редактирование / удаление
 # ---------------------------------------------------------------------------
+
+def _get_collection_key(is_req: bool, is_tr: bool) -> str:
+    if is_req:
+        return "requests"
+    if is_tr:
+        return "transfers"
+    return "transactions"
+
 
 # --- Вспомогательные функции для отрисовки экранов редактирования ---------
 
@@ -1582,12 +1597,7 @@ async def edit_list_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_req  = flt["type"] == "requests"
         is_tr   = flt["type"] == "transfers"
         data    = await asyncio.to_thread(load_data)
-        if is_req:
-            coll = data["requests"]
-        elif is_tr:
-            coll = data["transfers"]
-        else:
-            coll = data["transactions"]
+        coll    = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == item_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
             await query.edit_message_text("⛔ Операция недоступна.")
@@ -1618,12 +1628,7 @@ async def edit_field_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_req = context.user_data.get("edit_is_request", False)
         is_tr  = context.user_data.get("edit_is_transfer", False)
         data   = await asyncio.to_thread(load_data)
-        if is_req:
-            coll = data["requests"]
-        elif is_tr:
-            coll = data["transfers"]
-        else:
-            coll = data["transactions"]
+        coll   = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == tx_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
             await query.edit_message_text("⛔ Операция недоступна.")
@@ -1660,12 +1665,7 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
         is_req = context.user_data.get("edit_is_request", False)
         is_tr  = context.user_data.get("edit_is_transfer", False)
         data   = await asyncio.to_thread(load_data)
-        if is_req:
-            coll = data["requests"]
-        elif is_tr:
-            coll = data["transfers"]
-        else:
-            coll = data["transactions"]
+        coll   = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == tx_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
             await query.edit_message_text("⛔ Операция недоступна.")
@@ -1678,12 +1678,7 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
         is_req  = context.user_data.get("edit_is_request", False)
         is_tr   = context.user_data.get("edit_is_transfer", False)
         user_id = update.effective_user.id
-        if is_req:
-            key = "requests"
-        elif is_tr:
-            key = "transfers"
-        else:
-            key = "transactions"
+        key     = _get_collection_key(is_req, is_tr)
 
         deleted_amount = [None]
 
@@ -1718,10 +1713,15 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text    = (update.message.text or "").strip()
+    if BTN_CANCEL in text:
+        context.user_data.clear()
+        await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
     field   = context.user_data.get("edit_field")
     tx_id   = context.user_data.get("edit_tx_id")
     is_req  = context.user_data.get("edit_is_request", False)
-    text    = (update.message.text or "").strip()
     user_id = update.effective_user.id
 
     # Сначала валидируем ввод — без обращения к данным
@@ -1750,12 +1750,7 @@ async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     is_tr = context.user_data.get("edit_is_transfer", False)
-    if is_req:
-        key = "requests"
-    elif is_tr:
-        key = "transfers"
-    else:
-        key = "transactions"
+    key   = _get_collection_key(is_req, is_tr)
     found = [False]
 
     def mutate(data):
