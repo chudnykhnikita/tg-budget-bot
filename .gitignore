@@ -6,3 +6,4 @@ budget_data.json
 *.corrupt
 .DS_Store
 .idea/
+.bot.lock

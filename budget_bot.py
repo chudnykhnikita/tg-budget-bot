@@ -69,7 +69,10 @@ EDIT_PAGE_SIZE = 5
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-DATA_FILE       = os.environ.get("DATA_FILE", "/data/budget_data.json")
+DATA_FILE       = os.environ.get(
+    "DATA_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "budget_data.json")
+)
 MOSCOW_TZ       = ZoneInfo("Europe/Moscow")
 MAX_NOTE_LEN    = 128
 
@@ -109,6 +112,7 @@ BTN_TODAY             = "📅 Сегодня"
 BTN_YESTERDAY         = "📅 Вчера"
 BTN_BEFORE_YESTERDAY  = "📅 Позавчера"
 BTN_CANCEL            = "❌ Отмена"
+BTN_BACK              = "◀️ Назад"
 
 # Банки
 BANK_TINKOFF     = "tinkoff"
@@ -240,6 +244,29 @@ def _save_data_sync(data: dict):
         except FileNotFoundError:
             pass
         raise
+    _make_daily_backup(data, dir_)
+
+
+def _make_daily_backup(data: dict, dir_: str):
+    """Сохраняет одну копию в день в папку backups/, чистит копии старше 30 дней."""
+    try:
+        backup_dir = os.path.join(dir_, "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        today = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+        backup_path = os.path.join(backup_dir, f"budget_data_{today}.json")
+        if not os.path.exists(backup_path):
+            fd, tmp = tempfile.mkstemp(dir=backup_dir, prefix=".bak_", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, backup_path)
+            # Удаляем бэкапы старше 30 дней
+            cutoff = datetime.now(MOSCOW_TZ).timestamp() - 30 * 86400
+            for fname in os.listdir(backup_dir):
+                fpath = os.path.join(backup_dir, fname)
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.unlink(fpath)
+    except Exception:
+        pass  # бэкап не должен ломать основной поток
 
 
 async def save_data(data: dict):
@@ -348,15 +375,13 @@ def _strip_emoji(s) -> str:
 # ---------------------------------------------------------------------------
 
 def _reply_kb(options: list[str], add_free: bool = False, add_dates: bool = False,
-              cols: int = 2) -> ReplyKeyboardMarkup:
-    # Раскладываем варианты сеткой по `cols` колонок (по умолчанию 2),
-    # как основная клавиатура.
+              cols: int = 2, add_back: bool = False) -> ReplyKeyboardMarkup:
     rows = [options[i:i + cols] for i in range(0, len(options), cols)]
     if add_dates:
         rows.append([BTN_TODAY, BTN_YESTERDAY, BTN_BEFORE_YESTERDAY])
     if add_free:
         rows.append([BTN_FREE])
-    rows.append([BTN_CANCEL])
+    rows.append([BTN_BACK, BTN_CANCEL] if add_back else [BTN_CANCEL])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
 # ---------------------------------------------------------------------------
@@ -425,7 +450,7 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "Наличные" in text:
         context.user_data["account"] = "cash"
         kb = ReplyKeyboardMarkup(
-            [["➕ Поступление", "➖ Списание"], [BTN_CANCEL]],
+            [["➕ Поступление", "➖ Списание"], [BTN_BACK, BTN_CANCEL]],
             resize_keyboard=True, one_time_keyboard=True,
         )
         await update.message.reply_text("Поступление или списание?", reply_markup=kb)
@@ -434,7 +459,7 @@ async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["account"] = "card"
         context.user_data["bank"] = BANK_TINKOFF
         kb = ReplyKeyboardMarkup(
-            [["➕ Поступление", "➖ Списание"], [BTN_CANCEL]],
+            [["➕ Поступление", "➖ Списание"], [BTN_BACK, BTN_CANCEL]],
             resize_keyboard=True, one_time_keyboard=True,
         )
         await update.message.reply_text("Поступление или списание?", reply_markup=kb)
@@ -492,6 +517,8 @@ async def handle_direction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     if BTN_CANCEL in text:
         return await cancel(update, context)
+    if BTN_BACK in text:
+        return await cancel(update, context)
 
     if "Поступление" in text:
         context.user_data["direction"] = "income"
@@ -501,7 +528,7 @@ async def handle_direction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_CHOOSE_DIRECTION
 
     await update.message.reply_text("Введи сумму:", reply_markup=ReplyKeyboardMarkup(
-        [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+        [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
     ))
     return ST_ENTERING_AMOUNT
 
@@ -513,6 +540,14 @@ async def handle_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if BTN_CANCEL in text:
         return await cancel(update, context)
+    if BTN_BACK in text:
+        context.user_data.pop("direction", None)
+        kb = ReplyKeyboardMarkup(
+            [["➕ Поступление", "➖ Списание"], [BTN_BACK, BTN_CANCEL]],
+            resize_keyboard=True, one_time_keyboard=True,
+        )
+        await update.message.reply_text("Поступление или списание?", reply_markup=kb)
+        return ST_CHOOSE_DIRECTION
 
     try:
         amount = parse_amount(text)
@@ -533,13 +568,13 @@ async def _go_to_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Наличные — поступление
     if account == "cash" and direction == "income":
-        kb = _reply_kb(CASH_INCOME_CATEGORIES, add_free=True)
+        kb = _reply_kb(CASH_INCOME_CATEGORIES, add_free=True, add_back=True)
         await update.message.reply_text("Выбери категорию:", reply_markup=kb)
         return ST_CHOOSE_CATEGORY
 
     # Наличные — списание
     if account == "cash" and direction == "expense":
-        kb = _reply_kb(CASH_EXPENSE_CATEGORIES, add_free=True)
+        kb = _reply_kb(CASH_EXPENSE_CATEGORIES, add_free=True, add_back=True)
         await update.message.reply_text("Выбери категорию:", reply_markup=kb)
         return ST_CHOOSE_CATEGORY
 
@@ -549,7 +584,7 @@ async def _go_to_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Карта — списание
     if account == "card" and direction == "expense":
-        kb = _reply_kb(CARD_EXPENSE_CATEGORIES, add_free=True)
+        kb = _reply_kb(CARD_EXPENSE_CATEGORIES, add_free=True, add_back=True)
         await update.message.reply_text("Выбери категорию:", reply_markup=kb)
         return ST_CHOOSE_CATEGORY
 
@@ -564,11 +599,26 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     account   = context.user_data["account"]
     direction = context.user_data["direction"]
 
+    # Назад из свободного ввода или подкатегории → обратно к списку категорий
+    if BTN_BACK in text:
+        if context.user_data.pop("awaiting_free_category", False) or \
+           context.user_data.pop("awaiting_subcategory", False):
+            context.user_data.pop("category", None)
+            return await _go_to_category(update, context)
+        # Назад из главного списка категорий → обратно к вводу суммы
+        context.user_data.pop("category", None)
+        await update.message.reply_text("Введи сумму:", reply_markup=ReplyKeyboardMarkup(
+            [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+        ))
+        return ST_ENTERING_AMOUNT
+
     # Свободный ввод
     if text == BTN_FREE:
         await update.message.reply_text(
             "Напиши свою категорию:",
-            reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup(
+                [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+            )
         )
         context.user_data["awaiting_free_category"] = True
         return ST_CHOOSE_CATEGORY
@@ -588,28 +638,28 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == CAT_BANK:
             context.user_data["category"] = text
-            kb = _reply_kb(BANK_SUBCATEGORIES)
+            kb = _reply_kb(BANK_SUBCATEGORIES, add_back=True)
             await update.message.reply_text("Уточни:", reply_markup=kb)
             context.user_data["awaiting_subcategory"] = True
             return ST_CHOOSE_CATEGORY
 
         if text == CAT_DIV:
             context.user_data["category"] = text
-            kb = _reply_kb(DIVIDEND_SUBCATEGORIES)
+            kb = _reply_kb(DIVIDEND_SUBCATEGORIES, add_back=True)
             await update.message.reply_text("Кому?", reply_markup=kb)
             context.user_data["awaiting_subcategory"] = True
             return ST_CHOOSE_CATEGORY
 
         if text == CAT_ZP_WORKERS:
             context.user_data["category"] = text
-            kb = _reply_kb(WORKERS_SUBCATEGORIES)
+            kb = _reply_kb(WORKERS_SUBCATEGORIES, add_back=True)
             await update.message.reply_text("Кому и какая часть?", reply_markup=kb)
             context.user_data["awaiting_subcategory"] = True
             return ST_CHOOSE_CATEGORY
 
         if text == CAT_ZP:
             context.user_data["category"] = text
-            kb = _reply_kb([], add_dates=True)
+            kb = _reply_kb([], add_dates=True, add_back=True)
             await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
             return ST_ENTERING_ZP_DATE
 
@@ -617,7 +667,9 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["category"] = text
             await update.message.reply_text(
                 "Добавь пояснение (или /skip чтобы пропустить):",
-                reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True)
+                reply_markup=ReplyKeyboardMarkup(
+                    [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+                )
             )
             return ST_ENTERING_NOTE
 
@@ -631,7 +683,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Наличные — ЗП упаковщиков
     if text == CAT_ZP:
         context.user_data["category"] = text
-        kb = _reply_kb([], add_dates=True)
+        kb = _reply_kb([], add_dates=True, add_back=True)
         await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
         return ST_ENTERING_ZP_DATE
 
@@ -644,6 +696,9 @@ async def handle_zp_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if BTN_CANCEL in text:
         return await cancel(update, context)
+    if BTN_BACK in text:
+        context.user_data.pop("category", None)
+        return await _go_to_category(update, context)
 
     today = date.today()
     if text == BTN_TODAY:
@@ -664,6 +719,9 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if BTN_CANCEL in text:
         return await cancel(update, context)
+    if BTN_BACK in text:
+        context.user_data.pop("category", None)
+        return await _go_to_category(update, context)
     note = None if text == "/skip" else text[:MAX_NOTE_LEN]
     return await _finish(update, context,
                           category=context.user_data.get("category"),
@@ -785,7 +843,7 @@ async def handle_transfer_dir(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(
         "Введи сумму перевода:",
         reply_markup=ReplyKeyboardMarkup(
-            [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+            [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
         ),
     )
     return ST_ENTERING_TRANSFER_AMOUNT
@@ -823,6 +881,20 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
     text = (update.message.text or "").strip()
     if BTN_CANCEL in text:
         return await cancel(update, context)
+    if BTN_BACK in text:
+        context.user_data.pop("transfer", None)
+        context.user_data.pop("flow", None)
+        kb = ReplyKeyboardMarkup(
+            [
+                ["💳 → 💵  Карта → Наличные"],
+                ["💵 → 💳  Наличные → Карта"],
+                ["💳 → 💳  Карта → Карта"],
+                [BTN_CANCEL],
+            ],
+            resize_keyboard=True, one_time_keyboard=True,
+        )
+        await update.message.reply_text("Куда переводим?", reply_markup=kb)
+        return ST_CHOOSE_TRANSFER_DIR
 
     try:
         amount = parse_amount(text)
@@ -1759,12 +1831,34 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Запуск
 # ---------------------------------------------------------------------------
 
+def _pick_proxy(candidates: list) -> str:
+    """Возвращает первый работающий прокси из списка, или None если ни один не доступен."""
+    import httpx
+    for url in candidates:
+        try:
+            with httpx.Client(proxy=url, timeout=10) as client:
+                r = client.get("https://api.telegram.org")
+                if r.status_code < 500:
+                    logging.info("Прокси выбран: %s", url)
+                    return url
+        except Exception as e:
+            logging.warning("Прокси недоступен %s: %s", url, e)
+    return None
+
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Установи переменную окружения TELEGRAM_BOT_TOKEN")
 
-    proxy_url = os.environ.get("PROXY_URL")
+    proxy_candidates = [p for p in [
+        os.environ.get("PROXY_URL"),
+        os.environ.get("PROXY_URL_BACKUP"),
+    ] if p]
+    proxy_url = _pick_proxy(proxy_candidates) if proxy_candidates else None
+    if proxy_candidates and not proxy_url:
+        logging.warning("Ни один прокси не доступен, работаем без прокси")
+
     builder = (
         Application.builder()
         .token(token)
@@ -1858,4 +1952,12 @@ def main():
 
 
 if __name__ == "__main__":
+    import fcntl, sys
+    _lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.lock")
+    _lock_file = open(_lock_path, "w")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("Другой экземпляр бота уже запущен. Остановите его перед запуском нового.", file=sys.stderr)
+        sys.exit(1)
     main()
