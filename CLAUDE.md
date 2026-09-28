@@ -15,10 +15,15 @@ docker run -d --env-file .env -v budget_data:/data budget-bot
 
 `.env` variables:
 - `TELEGRAM_BOT_TOKEN` — required
-- `DATA_FILE` — path to JSON storage, defaults to `/data/budget_data.json`
-- `PROXY_URL` — optional HTTP proxy for the Telegram client
+- `DATA_FILE` — path to JSON storage. Defaults to a `budget_data.json` next to `budget_bot.py` (i.e. `/app/budget_data.json` in the container) — **not** `/data`. In Docker this must be set explicitly to `/data/budget_data.json` to land on the mounted volume, or the bot will silently start from an empty file.
+- `PROXY_URL` — optional SOCKS5 proxy for the Telegram client
+- `PROXY_URL_BACKUP` — optional second SOCKS5 proxy, tried if `PROXY_URL` fails a connectivity check at startup (`_pick_proxy()`)
 
 There are no tests or a linter configured.
+
+## Deployment
+
+Production runs on a remote VPS as the `budget-bot` Docker container, deployed via `./deploy.sh` (`git pull` + `docker build` + recreate container on the server). This only picks up commits that have been **pushed to `origin/main`** — local commits not yet pushed are invisible to the server. `deploy.sh` also only rebuilds the image; if `.env` on the server changes (new/renamed variable), the container must be recreated (`docker rm` + `docker run --env-file .env ...`), not just `docker restart`, or the old env stays in effect.
 
 ## Architecture
 
