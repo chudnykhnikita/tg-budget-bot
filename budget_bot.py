@@ -29,6 +29,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from proxy_failover import ProxyFailoverRequest
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -37,6 +38,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+# httpx logs full Bot API paths at INFO, which would expose the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Состояния диалога
@@ -401,7 +404,7 @@ def _reply_kb(options: list[str], add_free: bool = False, add_dates: bool = Fals
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
-        logger.warning("Transient network error: %s", err)
+        logger.warning("Transient network error (%s)", type(err).__name__)
         return
     logger.exception("Unhandled error", exc_info=err)
     if isinstance(update, Update) and update.effective_message:
@@ -1826,18 +1829,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Запуск
 # ---------------------------------------------------------------------------
 
-def _pick_proxy(candidates: list) -> str:
-    """Возвращает первый работающий прокси из списка, или None если ни один не доступен."""
+def _pick_proxy(candidates: list[tuple[str, str]]) -> int | None:
+    """Возвращает индекс первого прокси, который отвечает с хоста Telegram."""
     import httpx
-    for url in candidates:
+    for index, (label, url) in enumerate(candidates):
         try:
             with httpx.Client(proxy=url, timeout=10) as client:
                 r = client.get("https://api.telegram.org")
                 if r.status_code < 500:
-                    logging.info("Прокси выбран: %s", url)
-                    return url
+                    logging.info("Прокси доступен: %s", label)
+                    return index
         except Exception as e:
-            logging.warning("Прокси недоступен %s: %s", url, e)
+            logging.warning("Прокси %s недоступен (%s)", label, type(e).__name__)
     return None
 
 
@@ -1846,25 +1849,44 @@ def main():
     if not token:
         raise ValueError("Установи переменную окружения TELEGRAM_BOT_TOKEN")
 
-    proxy_candidates = [p for p in [
-        os.environ.get("PROXY_URL"),
-        os.environ.get("PROXY_URL_BACKUP"),
-    ] if p]
-    proxy_url = _pick_proxy(proxy_candidates) if proxy_candidates else None
-    if proxy_candidates and not proxy_url:
-        logging.warning("Ни один прокси не доступен, работаем без прокси")
+    proxy_candidates = [
+        (name, url)
+        for name in ("PROXY_URL", "PROXY_URL_BACKUP")
+        if (url := os.environ.get(name))
+    ]
+    selected_proxy = _pick_proxy(proxy_candidates) if proxy_candidates else None
+    routes = list(proxy_candidates)
+    routes.append(("direct", None))
+    initial_route = selected_proxy if selected_proxy is not None else 0
+    if proxy_candidates and selected_proxy is None:
+        logging.warning(
+            "Не удалось проверить настроенные прокси при старте; "
+            "запросы будут автоматически пробовать все маршруты"
+        )
 
-    builder = (
+    app = (
         Application.builder()
         .token(token)
-        .get_updates_read_timeout(25)
-        .get_updates_write_timeout(25)
-        .get_updates_connect_timeout(10)
-        .get_updates_pool_timeout(25)
+        .request(
+            ProxyFailoverRequest(
+                routes,
+                initial_route=initial_route,
+                connection_pool_size=256,
+            )
+        )
+        .get_updates_request(
+            ProxyFailoverRequest(
+                routes,
+                initial_route=initial_route,
+                connection_pool_size=1,
+                read_timeout=25,
+                write_timeout=25,
+                connect_timeout=10,
+                pool_timeout=25,
+            )
+        )
+        .build()
     )
-    if proxy_url:
-        builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
-    app = builder.build()
 
     app.add_error_handler(on_error)
 

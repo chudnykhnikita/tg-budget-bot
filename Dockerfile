@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY budget_bot.py .
+COPY proxy_failover.py .
 
 RUN mkdir -p /data
 

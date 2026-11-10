@@ -16,8 +16,10 @@ docker run -d --env-file .env -v budget_data:/data budget-bot
 `.env` variables:
 - `TELEGRAM_BOT_TOKEN` — required
 - `DATA_FILE` — path to JSON storage. Defaults to a `budget_data.json` next to `budget_bot.py` (i.e. `/app/budget_data.json` in the container) — **not** `/data`. In Docker this must be set explicitly to `/data/budget_data.json` to land on the mounted volume, or the bot will silently start from an empty file.
-- `PROXY_URL` — optional SOCKS5 proxy for the Telegram client
-- `PROXY_URL_BACKUP` — optional second SOCKS5 proxy, tried if `PROXY_URL` fails a connectivity check at startup (`_pick_proxy()`)
+- `PROXY_URL` — optional primary SOCKS5 proxy for Telegram
+- `PROXY_URL_BACKUP` — optional second SOCKS5 proxy
+
+The bot checks configured proxies at startup, then keeps all configured routes available at runtime. Both regular Bot API calls and `getUpdates` can fail over to the next proxy, then direct connectivity, on connection-stage errors. Polling also retries other transport failures because `getUpdates` is safe to repeat. For other Bot API methods, ambiguous read/write failures switch the active route for the next call without replaying a potentially completed action. When a fallback is active, the bot periodically checks whether a configured proxy has recovered. Bot API HTTP errors such as `409 Conflict` do not trigger proxy failover. Proxy labels are logged without credentials.
 
 There are no tests or a linter configured.
 
