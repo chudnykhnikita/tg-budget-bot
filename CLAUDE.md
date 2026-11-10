@@ -60,3 +60,7 @@ Categories are module-level string constants (with emoji prefixes). Certain card
 ## Excel export
 
 `export_excel()` builds a 6-sheet workbook (openpyxl): cash income, cash expenses, card income, card expenses, requests, transfers. It is triggered automatically whenever the user opens the balance view (`show_summary`), and also available via `/export`.
+
+## SSH с включённым Happ
+
+Перед SSH, SCP или деплоем на `83.166.245.224` читать [SERVER_ACCESS.md](SERVER_ACCESS.md). Использовать проверенный прямой маршрут через `en0`, сохраняя Happ включённым.
