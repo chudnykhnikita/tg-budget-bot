@@ -29,7 +29,7 @@ Production runs on a remote VPS as the `budget-bot` Docker container, deployed v
 
 ## Architecture
 
-The entire bot lives in a single file: `budget_bot.py`. It is a `python-telegram-bot` v21 async bot with two `ConversationHandler` state machines registered on the `Application`:
+The bot is `python-telegram-bot` v21. Structured screens (balance, accountant report, history, save confirm, `/start`) go through `tg_rich.py` (`sendRichMessage` + HTML fallback) and `budget_cards.py`. Short prompts stay regular messages. Two `ConversationHandler` state machines are registered on the `Application`:
 
 - **`edit_conv`** (registered first) — inline-keyboard flow for browsing, editing, and deleting existing records. States `EDIT_CHOOSE_TYPE` → `EDIT_CHOOSE_DIRECTION` → `EDIT_LIST` → `EDIT_CHOOSE_FIELD` → `EDIT_ENTERING_VALUE` / `EDIT_CONFIRM_DELETE`.
 - **`add_conv`** (registered second) — reply-keyboard flow for recording new transactions. States `ST_CHOOSE_ACCOUNT` → `ST_CHOOSE_DIRECTION` → `ST_ENTERING_AMOUNT` → `ST_CHOOSE_CATEGORY` → optional sub-states (`ST_ENTERING_ZP_DATE`, `ST_ENTERING_NOTE`) → save.
@@ -59,7 +59,7 @@ Categories are module-level string constants (with emoji prefixes). Certain card
 
 ## Excel export
 
-`export_excel()` builds a 6-sheet workbook (openpyxl): cash income, cash expenses, card income, card expenses, requests, transfers. It is triggered automatically whenever the user opens the balance view (`show_summary`), and also available via `/export`.
+`export_excel()` builds a 6-sheet workbook (openpyxl): cash income, cash expenses, card income, card expenses, requests, transfers. Balance (`💰 Баланс`) is a rich card without Excel. The accountant report (`📒 Отчёт`) and `/export` attach the file. Cancel on keyboards is `✖️ Отмена` (❌ is write-off only).
 
 ## SSH с включённым Happ
 

@@ -131,6 +131,37 @@ class BudgetMapTests(unittest.TestCase):
         self.assertEqual(m.income_followup(m.SRC_TRADE), m.FOLLOWUP_DONE)
         self.assertEqual(m.income_followup(m.SRC_OTHER), m.FOLLOWUP_NOTE_REQUIRED)
 
+    def test_november_income_labels(self):
+        self.assertEqual(m.income_source_for_sheet("cash", "от Алексея"), m.SRC_ALEXEY)
+        self.assertEqual(m.income_source_for_sheet("cash", "от Алексея Маркова"), m.SRC_ALEXEY)
+        self.assertEqual(
+            m.income_source_for_sheet("cash", "прочие доходы - отдал оптовый клиент из Темрюка"),
+            m.SRC_OTHER,
+        )
+        self.assertEqual(
+            m.income_source_for_sheet("cash", "остаток с прошлого периода"),
+            m.SRC_OPENING,
+        )
+
+    def test_november_expense_labels(self):
+        self.assertEqual(
+            m.expense_from_label("ЗП Михаила 2 часть за октябрь", None),
+            (m.CAT_ZP_WORKERS, "Михаил 2 часть"),
+        )
+        self.assertEqual(m.expense_from_label("Дивиденды Алексей", None), (m.CAT_DIV, "Алексей"))
+        self.assertEqual(
+            m.expense_from_label("обеды с 2.11 по 15.11", None),
+            (m.CAT_MEAL, "обеды с 2.11 по 15.11"),
+        )
+        self.assertEqual(
+            m.expense_from_label("Сергею за поддержание работы бота", None),
+            (m.CAT_CONTRACTORS, "Бот (Сергей)"),
+        )
+        self.assertEqual(
+            m.expense_from_label("Доставка Байкал сервис", None),
+            (m.CAT_DELIVERY, "Байкал сервис"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

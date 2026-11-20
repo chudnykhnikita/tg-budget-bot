@@ -9,6 +9,8 @@ COPY budget_bot.py .
 COPY proxy_failover.py .
 COPY budget_map.py .
 COPY sheets_budget.py .
+COPY tg_rich.py .
+COPY budget_cards.py .
 
 RUN mkdir -p /data
 

@@ -33,6 +33,8 @@ from proxy_failover import ProxyFailoverRequest
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import budget_map as m
+import budget_cards
+import tg_rich as rich_msg
 
 try:
     import sheets_budget as sheets_store
@@ -138,8 +140,16 @@ BTN_FREE              = "✏️ Свой вариант"
 BTN_TODAY             = "📅 Сегодня"
 BTN_YESTERDAY         = "📅 Вчера"
 BTN_BEFORE_YESTERDAY  = "📅 Позавчера"
-BTN_CANCEL            = "❌ Отмена"
+BTN_CANCEL            = "✖️ Отмена"
 BTN_BACK              = "◀️ Назад"
+BTN_CASH              = "💵 Наличные"
+BTN_CARD              = "💳 Карта"
+BTN_TRANSFER          = "🔄 Перевод"
+BTN_REQUEST           = "📨 Запросил"
+BTN_BALANCE           = "💰 Баланс"
+BTN_REPORT            = "📒 Отчёт"
+BTN_HISTORY           = "🕓 История"
+BTN_EDIT              = "✏️ Изменить"
 
 # Банки
 BANK_TINKOFF     = "tinkoff"
@@ -166,10 +176,10 @@ def _bank_label(bank: str | None) -> str:
 # ---------------------------------------------------------------------------
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["💵 Наличные", "💳 Карта"],
-        ["🔄 Перевод"],
-        ["💰 Баланс",   "🕓 История"],
-        ["✏️ Изменить", "📨 Запросил"],
+        [BTN_CASH, BTN_CARD],
+        [BTN_TRANSFER, BTN_REQUEST],
+        [BTN_BALANCE, BTN_REPORT],
+        [BTN_HISTORY, BTN_EDIT],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -474,13 +484,17 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # /start
 # ---------------------------------------------------------------------------
 
+async def _send_card(update: Update, html: str, reply_markup=MAIN_KEYBOARD):
+    await rich_msg.reply(update.effective_message, html, reply_markup=reply_markup)
+
+
+async def _snapshot_for(update: Update) -> dict:
+    data = await asyncio.to_thread(load_data)
+    return budget_cards.build_snapshot(data, update.effective_user.id)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет! Я бот для ведения бюджета.\n\n"
-        "Выбери счёт кнопками внизу.\n\n"
-        "/clear — очистить все данные",
-        reply_markup=MAIN_KEYBOARD,
-    )
+    await _send_card(update, budget_cards.welcome_html())
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -490,11 +504,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
 
-    if "Баланс" in text:
+    if text == BTN_BALANCE or "Баланс" in text:
         await show_summary(update, context)
         return ConversationHandler.END
-    if "История" in text:
+    if text == BTN_HISTORY or "История" in text:
         await history(update, context)
+        return ConversationHandler.END
+    if text == BTN_REPORT or "Отчёт" in text or "Отчет" in text:
+        await show_report(update, context)
         return ConversationHandler.END
 
     if "Запросил" in text:
@@ -805,18 +822,16 @@ async def _finish(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         return ConversationHandler.END
 
-    acc_label  = "💵 Наличные" if account == "cash" else "💳 Карта"
-    bank_label = f" [{_bank_label(bank)}]" if bank else ""
-    dir_label  = "Поступление" if direction == "income" else "Списание"
-    cat_label  = f" · {category}" if category else ""
-    note_label = f" · {note}" if note else ""
-
-    await update.message.reply_text(
-        f"✅ {acc_label}{bank_label} | {dir_label} {fmt(amount)} ₽{cat_label}{note_label} сохранено!",
-        reply_markup=MAIN_KEYBOARD,
-    )
+    acc_label  = "Наличные" if account == "cash" else "Карта"
+    lines = [acc_label + (f" · {_bank_label(bank)}" if bank else "")]
+    if category:
+        lines.append(category)
+    if note:
+        lines.append(note)
+    title = "✅ Поступило" if direction == "income" else "✅ Списано"
+    snap = await _snapshot_for(update)
+    await _send_card(update, budget_cards.saved_html(title, lines, amount, snap))
     context.user_data.clear()
-    await show_summary(update, context)
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -845,26 +860,21 @@ async def handle_request_amount(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
 
-    # Показываем сводку: сколько всего запрошено, сколько уже пришло, сколько осталось
-    data    = await asyncio.to_thread(load_data)
-    txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
-    reqs    = [r for r in data["requests"]     if r["user_id"] == user_id]
-    total_req     = sum(Decimal(r["amount"]) for r in reqs)
-    total_card_in = sum(
-        Decimal(t["amount"]) for t in txs
-        if t.get("account") == "card" and t["type"] == "income"
-    )
-    remaining = total_req - total_card_in
-
-    await update.message.reply_text(
-        f"✅ Запрошено {fmt(amount)} ₽\n\n"
-        f"📨 Всего запрошено:  {fmt(total_req)} ₽\n"
-        f"💳 Получено по карте: {fmt(total_card_in)} ₽\n"
-        f"⏳ Осталось получить: {fmt(remaining)} ₽",
-        reply_markup=MAIN_KEYBOARD,
+    snap = await _snapshot_for(update)
+    await _send_card(
+        update,
+        budget_cards.saved_html(
+            "✅ Запрос",
+            [
+                f"Всего запрошено {fmt(snap['req_total'])} ₽",
+                f"Пришло на карту {fmt(snap['req_got'])} ₽",
+                f"Осталось {fmt(snap['req_remaining'])} ₽",
+            ],
+            amount,
+            snap,
+        ),
     )
     context.user_data.clear()
-    await show_summary(update, context)
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -974,16 +984,21 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
         )
         return ConversationHandler.END
 
-    src_lbl      = "💳 Карта" if src == "card" else "💵 Наличные"
-    dst_lbl      = "💳 Карта" if dst == "card" else "💵 Наличные"
-    bank_from_lbl = f" [{_bank_label(bank)}]"    if bank    else ""
-    bank_to_lbl   = f" [{_bank_label(bank_to)}]" if bank_to else ""
-    await update.message.reply_text(
-        f"✅ Перевод {fmt(amount)} ₽\n{src_lbl}{bank_from_lbl} → {dst_lbl}{bank_to_lbl} сохранён.",
-        reply_markup=MAIN_KEYBOARD,
+    src_lbl      = "Карта" if src == "card" else "Наличные"
+    dst_lbl      = "Карта" if dst == "card" else "Наличные"
+    bank_from_lbl = f" {_bank_label(bank)}"    if bank    else ""
+    bank_to_lbl   = f" {_bank_label(bank_to)}" if bank_to else ""
+    snap = await _snapshot_for(update)
+    await _send_card(
+        update,
+        budget_cards.saved_html(
+            "✅ Перевод",
+            [f"{src_lbl}{bank_from_lbl} → {dst_lbl}{bank_to_lbl}"],
+            amount,
+            snap,
+        ),
     )
     context.user_data.clear()
-    await show_summary(update, context)
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -991,183 +1006,26 @@ async def handle_transfer_amount(update: Update, context: ContextTypes.DEFAULT_T
 # ---------------------------------------------------------------------------
 
 async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data    = await asyncio.to_thread(load_data)
-    user_id = update.effective_user.id
-    txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
-    reqs    = [r for r in data["requests"]     if r["user_id"] == user_id]
-    trs     = [t for t in data["transfers"]    if t["user_id"] == user_id]
+    snap = await _snapshot_for(update)
+    await _send_card(update, budget_cards.balance_html(snap))
 
-    if not txs and not reqs and not trs:
-        await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
-        return
 
-    def totals(account, bank=None):
-        """Поступления и списания по счёту; bank=None — все банки."""
-        inc = sum(Decimal(t["amount"]) for t in txs
-                  if t.get("account") == account and t.get("type") == "income"
-                  and (bank is None or t.get("bank") == bank))
-        exp = sum(Decimal(t["amount"]) for t in txs
-                  if t.get("account") == account and t.get("type") == "expense"
-                  and (bank is None or t.get("bank") == bank))
-        return inc, exp
-
-    cash_inc, cash_exp = totals("cash")
-    card_inc, card_exp = totals("card")
-
-    # Переводы: чистое движение по каждому счёту (переводы не привязаны к банку)
-    cash_tr_in  = sum(Decimal(t["amount"]) for t in trs if t["to"]   == "cash")
-    cash_tr_out = sum(Decimal(t["amount"]) for t in trs if t["from"] == "cash")
-    card_tr_in  = sum(Decimal(t["amount"]) for t in trs if t["to"]   == "card")
-    card_tr_out = sum(Decimal(t["amount"]) for t in trs if t["from"] == "card")
-    cash_tr_net = cash_tr_in - cash_tr_out
-    card_tr_net = card_tr_in - card_tr_out
-
-    cash_bal = cash_inc - cash_exp + cash_tr_net
-    card_bal = card_inc - card_exp + card_tr_net
-    total    = cash_bal + card_bal
-
-    # Запросы: сколько запрошено и сколько ещё не пришло (минус поступления на карту)
-    total_req = sum(Decimal(r["amount"]) for r in reqs)
-    remaining = total_req - card_inc
-    req_lines = ""
-    if reqs:
-        req_lines = (
-            "\n\n📨 Запросы\n"
-            f"  Запрошено:        {fmt(total_req)} ₽\n"
-            f"  Получено (карта): {fmt(card_inc)} ₽\n"
-            f"  Осталось:         {fmt(remaining)} ₽"
+async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    snap = await _snapshot_for(update)
+    markup = MAIN_KEYBOARD
+    if not snap["empty"]:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📎 Excel", callback_data="acct_excel")]]
         )
-
-    # Расходы по категориям (карта)
-    categories: dict[str, Decimal] = {}
-    for t in txs:
-        if t["type"] == "expense" and t.get("category"):
-            key = m.category_for_sheet(t["category"]) or t["category"]
-            if t.get("note"):
-                key += f" · {t['note']}"
-            categories[key] = categories.get(key, Decimal("0")) + Decimal(t["amount"])
-
-    cat_lines = ""
-    if categories:
-        sorted_cats = sorted(categories.items(), key=lambda x: -x[1])
-        cat_lines = "\n\n📊 Расходы по категориям:\n" + "\n".join(
-            f"  • {k}: {fmt(v)} ₽" for k, v in sorted_cats
-        )
-
-    def _signed(v: Decimal) -> str:
-        return ("+" + fmt(v)) if v > 0 else fmt(v)
-
-    cash_tr_line = (f"  Переводы:    {_signed(cash_tr_net)} ₽\n" if trs else "")
-    card_tr_line = (f"  Переводы:    {_signed(card_tr_net)} ₽\n" if trs else "")
-
-    # Разбивка карты по банкам (показываем только банки у которых есть операции/переводы)
-    bank_order = [(BANK_TINKOFF, "🟡 Тиньков"), (BANK_VTB, "🔵 ВТБ")]
-    card_bank_lines = ""
-    active_banks = 0
-    for bank_key, bank_name in bank_order:
-        b_inc, b_exp = totals("card", bank=bank_key)
-        b_tr_in  = sum(Decimal(t["amount"]) for t in trs
-                       if t.get("to") == "card" and (
-                           t.get("bank_to") == bank_key if t.get("from") == "card"
-                           else t.get("bank") == bank_key
-                       ))
-        b_tr_out = sum(Decimal(t["amount"]) for t in trs
-                       if t.get("from") == "card" and t.get("bank") == bank_key)
-        b_tr_net = b_tr_in - b_tr_out
-        if b_inc == 0 and b_exp == 0 and b_tr_net == 0:
-            continue
-        active_banks += 1
-        b_bal     = b_inc - b_exp + b_tr_net
-        b_tr_line = (f"\n    Переводы:    {_signed(b_tr_net)} ₽" if b_tr_net != 0 else "")
-        card_bank_lines += (
-            f"\n  {bank_name}\n"
-            f"    Поступления: {fmt(b_inc)} ₽\n"
-            f"    Списания:    {fmt(b_exp)} ₽"
-            f"{b_tr_line}\n"
-            f"    Баланс:      {fmt(b_bal)} ₽"
-        )
-
-    # Если активных банков больше одного — показываем разбивку и итого
-    if active_banks <= 1:
-        card_bank_lines = ""
-    card_total_line = ""
-    if active_banks > 1:
-        card_total_line = (
-            f"\n  ──────────────────\n"
-            f"  Итого по картам\n"
-            f"    Поступления: {fmt(card_inc)} ₽\n"
-            f"    Списания:    {fmt(card_exp)} ₽\n"
-            f"{('    Переводы:    ' + _signed(card_tr_net) + ' ₽\n') if trs else ''}"
-            f"    Баланс:      {fmt(card_bal)} ₽"
-        )
-    else:
-        card_total_line = (
-            f"\n  Поступления: {fmt(card_inc)} ₽\n"
-            f"  Списания:    {fmt(card_exp)} ₽\n"
-            f"{card_tr_line}"
-            f"  Баланс:      {fmt(card_bal)} ₽"
-        )
-
-    text = (
-        f"💵 Наличные\n"
-        f"  Поступления: {fmt(cash_inc)} ₽\n"
-        f"  Списания:    {fmt(cash_exp)} ₽\n"
-        f"{cash_tr_line}"
-        f"  Баланс:      {fmt(cash_bal)} ₽\n\n"
-        f"💳 Карта"
-        f"{card_bank_lines}"
-        f"{card_total_line}\n\n"
-        f"{'✅' if total >= 0 else '⚠️'} Общий баланс: {fmt(total)} ₽"
-        f"{req_lines}"
-        f"{cat_lines}"
-    )
-
-    await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
-
-    # Сразу отправляем Excel (данные уже загружены — не перечитываем файл)
-    try:
-        await export_excel(update, context, _data=data)
-    except Exception as e:
-        logger.warning("export_excel failed: %s", e)
+    await _send_card(update, budget_cards.report_html(snap), reply_markup=markup)
 
 # ---------------------------------------------------------------------------
 # История
 # ---------------------------------------------------------------------------
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data    = await asyncio.to_thread(load_data)
-    user_id = update.effective_user.id
-    txs     = [t for t in data["transactions"] if t["user_id"] == user_id]
-
-    if not txs:
-        await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
-        return
-
-    cash_lines, card_lines = [], []
-    for t in txs[-20:][::-1]:
-        acc      = t.get("account", "card")
-        cat      = f" ({t['category']})" if t.get("category") else ""
-        note     = f" · {t['note']}" if t.get("note") else ""
-        bank_str = f" [{_bank_label(t.get('bank'))}]" if acc == "card" else ""
-        if t.get("type") == "income":
-            line = f"➕ +{fmt(t['amount'])} ₽{cat}{note}{bank_str}  [{t['date']}]"
-        else:
-            line = f"➖ -{fmt(t['amount'])} ₽{cat}{note}{bank_str}  [{t['date']}]"
-        if acc == "cash":
-            cash_lines.append(line)
-        else:
-            card_lines.append(line)
-
-    parts = []
-    if cash_lines:
-        parts.append("💵 Наличные:\n" + "\n".join(cash_lines))
-    if card_lines:
-        parts.append("💳 Карта:\n" + "\n".join(card_lines))
-
-    await update.message.reply_text(
-        "🕓 Последние операции:\n\n" + "\n\n".join(parts),
-        reply_markup=MAIN_KEYBOARD,
-    )
+    snap = await _snapshot_for(update)
+    await _send_card(update, budget_cards.history_html(snap))
 
 # ---------------------------------------------------------------------------
 # Экспорт Excel (5 листов: Наличные поступления/списания, Карта поступления/списания, Запросы)
@@ -1182,8 +1040,9 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE,
     reqs    = [r for r in _data["requests"]     if r["user_id"] == user_id]
     trs     = [t for t in _data["transfers"]    if t["user_id"] == user_id]
 
+    target = update.effective_message
     if not txs and not reqs and not trs:
-        await update.message.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
+        await target.reply_text("📭 Операций пока нет.", reply_markup=MAIN_KEYBOARD)
         return
 
     wb = Workbook()
@@ -1293,13 +1152,19 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE,
     wb.save(buf)
     buf.seek(0)
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
-    await update.message.reply_document(
+    await target.reply_document(
         document=buf,
         filename=f"budget_{now}.xlsx",
-        caption="📊 Готово!",
+        caption="📊 Excel для бухгалтера",
         write_timeout=60,
         read_timeout=30,
     )
+
+
+async def export_excel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await export_excel(update, context)
 
 # ---------------------------------------------------------------------------
 # Редактирование / удаление
@@ -1359,7 +1224,7 @@ async def _edit_render_type_picker(target):
         [InlineKeyboardButton("💳 Карта",     callback_data="edit_type:card")],
         [InlineKeyboardButton("📨 Запросы",   callback_data="edit_type:requests")],
         [InlineKeyboardButton("🔄 Переводы",  callback_data="edit_type:transfers")],
-        [InlineKeyboardButton("❌ Отмена",    callback_data="edit_cancel")],
+        [InlineKeyboardButton("✖️ Отмена",    callback_data="edit_cancel")],
     ]
     text = "Что редактируем?"
     kb   = InlineKeyboardMarkup(buttons)
@@ -1376,7 +1241,7 @@ async def _edit_render_direction_picker(query, account: str):
         [InlineKeyboardButton("➖ Списания",    callback_data="edit_dir:expense")],
         [
             InlineKeyboardButton("◀️ Назад",  callback_data="edit_back_type"),
-            InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+            InlineKeyboardButton("✖️ Отмена", callback_data="edit_cancel"),
         ],
     ]
     await query.edit_message_text(
@@ -1407,7 +1272,7 @@ async def _edit_render_list(query, context, user_id: int):
     if not items:
         buttons = [[
             InlineKeyboardButton("◀️ Назад",  callback_data=back_cb),
-            InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+            InlineKeyboardButton("✖️ Отмена", callback_data="edit_cancel"),
         ]]
         await query.edit_message_text(
             f"{title}\n\nПока нет операций.",
@@ -1441,7 +1306,7 @@ async def _edit_render_list(query, context, user_id: int):
 
     buttons.append([
         InlineKeyboardButton("◀️ Назад",  callback_data=back_cb),
-        InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+        InlineKeyboardButton("✖️ Отмена", callback_data="edit_cancel"),
     ])
 
     await query.edit_message_text(
@@ -1474,7 +1339,7 @@ async def _edit_render_item(query, context, item: dict,
             [InlineKeyboardButton("🗑 Удалить", callback_data="edit_delete")],
             [
                 InlineKeyboardButton("◀️ Назад",  callback_data="edit_back_list"),
-                InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+                InlineKeyboardButton("✖️ Отмена", callback_data="edit_cancel"),
             ],
         ]
     elif is_request:
@@ -1489,7 +1354,7 @@ async def _edit_render_item(query, context, item: dict,
             [InlineKeyboardButton("🗑 Удалить", callback_data="edit_delete")],
             [
                 InlineKeyboardButton("◀️ Назад",  callback_data="edit_back_list"),
-                InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+                InlineKeyboardButton("✖️ Отмена", callback_data="edit_cancel"),
             ],
         ]
     else:
@@ -1513,7 +1378,7 @@ async def _edit_render_item(query, context, item: dict,
             [InlineKeyboardButton("🗑 Удалить",    callback_data="edit_delete")],
             [
                 InlineKeyboardButton("◀️ Назад",  callback_data="edit_back_list"),
-                InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+                InlineKeyboardButton("✖️ Отмена", callback_data="edit_cancel"),
             ],
         ]
     await query.edit_message_text(desc, reply_markup=InlineKeyboardMarkup(buttons))
@@ -1564,7 +1429,7 @@ async def edit_pick_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "edit_cancel":
-        await query.edit_message_text("❌ Отменено.")
+        await query.edit_message_text("✖️ Отменено.")
         return ConversationHandler.END
 
     if not query.data.startswith("edit_type:"):
@@ -1586,7 +1451,7 @@ async def edit_pick_direction(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     if query.data == "edit_cancel":
-        await query.edit_message_text("❌ Отменено.")
+        await query.edit_message_text("✖️ Отменено.")
         return ConversationHandler.END
 
     if query.data == "edit_back_type":
@@ -1609,7 +1474,7 @@ async def edit_list_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "edit_cancel":
-        await query.edit_message_text("❌ Отменено.")
+        await query.edit_message_text("✖️ Отменено.")
         return ConversationHandler.END
 
     if query.data == "edit_noop":
@@ -1655,7 +1520,7 @@ async def edit_field_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "edit_cancel":
-        await query.edit_message_text("❌ Отменено.")
+        await query.edit_message_text("✖️ Отменено.")
         return ConversationHandler.END
 
     if query.data == "edit_back_list":
@@ -1755,7 +1620,7 @@ async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text    = (update.message.text or "").strip()
     if BTN_CANCEL in text:
         context.user_data.clear()
-        await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("✖️ Отменено.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
     field   = context.user_data.get("edit_field")
@@ -1858,7 +1723,7 @@ async def clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KEYBOARD)
+    await update.message.reply_text("✖️ Отменено.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
@@ -1927,7 +1792,7 @@ def main():
     app.add_error_handler(on_error)
 
     main_filter = filters.Regex(
-        "^(💵 Наличные|💳 Карта|💰 Баланс|🕓 История|📨 Запросил|🔄 Перевод)$"
+        r"^(💵 Наличные|💳 Карта|💰 Баланс|📒 Отчёт|🕓 История|📨 Запросил|🔄 Перевод)$"
     )
 
     add_conv = ConversationHandler(
@@ -1994,6 +1859,7 @@ def main():
 
     app.add_handler(CommandHandler("export", export_excel))
     app.add_handler(CommandHandler("clear",  clear))
+    app.add_handler(CallbackQueryHandler(export_excel_button, pattern="^acct_excel$"))
     app.add_handler(CallbackQueryHandler(clear_confirm, pattern="^clear_"))
     # edit_conv ставим первым: чтобы кнопка «✏️ Изменить» захватывалась им,
     # а не общей add_conv (которая иначе съест регекспом из main_filter).

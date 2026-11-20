@@ -148,6 +148,12 @@ def category_for_sheet(category: str | None) -> str:
         "доставка из китая": CAT_DELIVERY_CN,
         "Возврат 15%": CAT_REFUND_15,
         "Компенсация 15%": CAT_REFUND_15,
+        "от Алексея": SRC_ALEXEY,
+        "от Алексея Маркова": SRC_ALEXEY,
+        "отдал Алексей Марков на расходы": SRC_ALEXEY,
+        "Дивиденды Алексей": CAT_DIV,
+        "Дивиденды Андрей": CAT_DIV,
+        "Дивиденды Никита": CAT_DIV,
     }
     if raw in aliases:
         return aliases[raw]
@@ -170,7 +176,46 @@ def income_source_for_sheet(account: str, category: str | None) -> str:
         return SRC_TRADE
     if sheet_cat == CAT_SALE_BOT:
         return SRC_SALE
+    low = (category or "").lower()
+    if "алексе" in low:
+        return SRC_ALEXEY
+    if "андре" in low and "марков" not in low:
+        return SRC_ANDREY
+    if "прочие" in low or "оптовый" in low or "темрюк" in low:
+        return SRC_OTHER
     return sheet_cat or SRC_OTHER
+
+
+def expense_from_label(category: str | None, note: str | None) -> tuple[str, str | None]:
+    """Free-text Excel category → sheet category + note."""
+    raw = strip_emoji(category)
+    kept = strip_emoji(note) or None
+    if not raw:
+        return CAT_OTHER_EXP, kept
+    mapped = category_for_sheet(raw)
+    if mapped in EXPENSE_CATEGORIES:
+        if mapped == CAT_DIV and raw.lower().startswith("дивиденды") and " " in raw:
+            who = strip_emoji(raw.split(None, 1)[1]) or kept
+            return CAT_DIV, who
+        return mapped, kept
+    low = raw.lower()
+    if low.startswith("дивиденды"):
+        who = strip_emoji(raw.split(None, 1)[1]) if " " in raw else None
+        return CAT_DIV, who or kept
+    if "михаил" in low and ("зп" in low or "часть" in low or "зарплат" in low):
+        part = "Михаил 2 часть" if "2" in raw else "Михаил 1 часть" if "1" in raw else "Михаил"
+        return CAT_ZP_WORKERS, part
+    if "никита" in low and ("зп" in low or "часть" in low or "зарплат" in low):
+        part = "Никита 2 часть" if "2" in raw else "Никита 1 часть" if "1" in raw else "Никита"
+        return CAT_ZP_WORKERS, part
+    if "обед" in low:
+        return CAT_MEAL, kept or raw
+    if "серге" in low:
+        return CAT_CONTRACTORS, "Бот (Сергей)"
+    if low.startswith("доставка") and "китай" not in low:
+        extra = raw[len("Доставка"):].strip(" -")
+        return CAT_DELIVERY, extra or kept
+    return mapped, kept
 
 
 def bank_label(bank: str | None) -> str:
