@@ -38,7 +38,7 @@ The entire bot lives in a single file: `budget_bot.py`. It is a `python-telegram
 
 ## Data layer
 
-All persistence is a single JSON file with three top-level arrays: `transactions`, `requests`, `transfers`. Every record carries a UUID `id`, `user_id`, ISO-formatted `date` (Moscow time), and `amount` stored as a decimal string `"X.XX"`.
+All persistence is a single JSON file with three top-level arrays: `transactions`, `requests`, `transfers`. Every record carries a UUID `id`, `user_id`, ISO-formatted `date` (Moscow time), and `amount` stored as a decimal string `"X.XX"`. When `GOOGLE_CREDENTIALS_FILE` is set, the bot also writes the same record to Google Sheets and refuses the save if the sheet write fails. JSON remains the copy the running bot reads.
 
 Key rules:
 - All writes go through `_atomic_modify(mutator)`, which holds a global `asyncio.Lock` and writes via `tempfile + os.replace` to prevent corruption.

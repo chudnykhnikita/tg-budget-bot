@@ -32,6 +32,12 @@ from telegram.ext import (
 from proxy_failover import ProxyFailoverRequest
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
+import budget_map as m
+
+try:
+    import sheets_budget as sheets_store
+except ImportError:
+    sheets_store = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,36 +85,54 @@ DATA_FILE       = os.environ.get(
 MOSCOW_TZ       = ZoneInfo("Europe/Moscow")
 MAX_NOTE_LEN    = 128
 
-# Категории (константы — используются и как лейблы кнопок, и как ключи).
-CAT_BANK       = "🏦 Плата банку"
-CAT_ZP         = "👷 ЗП упаковщиков"
-CAT_ZP_WORKERS = "💼 ЗП работников"
-CAT_DIV        = "💎 Дивиденды"
-CAT_MEAL       = "🍽 Обеды"
-CAT_OFC        = "🏢 Офис"
-CAT_WH         = "📦 Склад"
+_CAT_EMOJI = {
+    m.CAT_ZP: "👷",
+    m.CAT_ZP_WORKERS: "💼",
+    m.CAT_DIV: "💎",
+    m.CAT_MEAL: "🍽",
+    m.CAT_OFC: "🏢",
+    m.CAT_WH: "📦",
+    m.CAT_DELIVERY_CN: "✈️",
+    m.CAT_DELIVERY: "🚚",
+    m.CAT_BANK: "🏦",
+    m.CAT_TAX: "📑",
+    m.CAT_CONTRACTORS: "🛠",
+    m.CAT_COMP: "↩️",
+    m.CAT_REFUND_15: "💸",
+    m.CAT_OTHER_EXP: "✏️",
+}
+_SRC_EMOJI = {
+    m.SRC_TRADE: "🏢",
+    m.SRC_ALEXEY: "👤",
+    m.SRC_ANDREY: "👤",
+    m.SRC_SALE: "🛒",
+    m.SRC_OTHER: "✏️",
+}
 
-CAT_SALE  = "🛒 Продажа со склада"
 
-SUB_BANK_SERVICE = "🧾 Обслуживание счёта"
-SUB_BANK_FEE     = "💸 Комиссия"
+def _labeled(name: str, emoji: dict[str, str]) -> str:
+    prefix = emoji.get(name)
+    return f"{prefix} {name}" if prefix else name
 
-CAT_COMP = "↩️ Компенсация клиенту за брак"
 
-# Категории карты — списания
-CARD_EXPENSE_CATEGORIES = [CAT_BANK, CAT_ZP, CAT_ZP_WORKERS, CAT_DIV, CAT_MEAL, CAT_OFC, CAT_WH, CAT_COMP]
-# Подкатегории «Плата банку»
-BANK_SUBCATEGORIES = [SUB_BANK_SERVICE, SUB_BANK_FEE]
-# Подкатегории «Дивиденды» (имена без эмодзи)
-DIVIDEND_SUBCATEGORIES = ["Андрей", "Алексей", "Никита"]
-# Подкатегории «ЗП работников» — выплаты по частям
-WORKERS_SUBCATEGORIES = ["Никита 1 часть", "Никита 2 часть", "Михаил 1 часть", "Михаил 2 часть", "Премия Михаил", "Премия Никита"]
+def _expense_btn(name: str) -> str:
+    return _labeled(name, _CAT_EMOJI)
 
-# Категории наличных — поступления (кнопки + свободный ввод)
-CASH_INCOME_CATEGORIES = [CAT_SALE]
 
-# Категории наличных — списания (кнопки + свободный ввод)
-CASH_EXPENSE_CATEGORIES = [CAT_ZP]
+def _income_btn(name: str) -> str:
+    return _labeled(name, _SRC_EMOJI)
+
+
+def _match_named(text: str, names: list[str], to_btn) -> str | None:
+    stripped = m.strip_emoji(text)
+    for name in names:
+        if text == to_btn(name) or stripped == name:
+            return name
+    return None
+
+
+EXPENSE_BUTTONS = [_expense_btn(c) for c in m.EXPENSE_CATEGORIES]
+INCOME_BUTTONS = [_income_btn(s) for s in m.INCOME_SOURCES]
 
 BTN_FREE              = "✏️ Свой вариант"
 BTN_TODAY             = "📅 Сегодня"
@@ -278,13 +302,46 @@ async def save_data(data: dict):
         await asyncio.to_thread(_save_data_sync, data)
 
 
-async def _atomic_modify(mutator):
+async def _atomic_modify(mutator, *, mirror_sheet: bool = True):
     """Атомарно: load → mutator(data) → save. Под одним локом —
     защищает от гонок между конкурентными write-операциями."""
     async with _lock:
         data = await asyncio.to_thread(load_data)
         mutator(data)
+        if (
+            mirror_sheet
+            and sheets_store is not None
+            and sheets_store.configured()
+        ):
+            try:
+                await asyncio.to_thread(sheets_store.modify, mutator)
+            except Exception as exc:
+                logger.exception("Google Sheet update failed")
+                raise OSError("sheet write failed") from exc
         await asyncio.to_thread(_save_data_sync, data)
+
+
+def _sheet_append(kind: str, record: dict) -> None:
+    if sheets_store is None:
+        return
+    if kind == "transaction":
+        sheets_store.append_transaction(record)
+    elif kind == "request":
+        sheets_store.append_request(record)
+    elif kind == "transfer":
+        sheets_store.append_transfer(record)
+    else:
+        raise ValueError(kind)
+
+
+async def _persist(kind: str, record: dict, mutator) -> None:
+    if sheets_store is not None and sheets_store.configured():
+        try:
+            await asyncio.to_thread(_sheet_append, kind, record)
+        except Exception as exc:
+            logger.exception("Google Sheet write failed")
+            raise OSError("sheet write failed") from exc
+    await _atomic_modify(mutator, mirror_sheet=False)
 
 
 async def _save_transaction(user_id: int, amount: Decimal, t_type: str,
@@ -301,8 +358,9 @@ async def _save_transaction(user_id: int, amount: Decimal, t_type: str,
         "note":     note,
         "bank":     bank,          # "tinkoff" | "vtb" | None (наличные)
         "date":     now,
+        "status":   m.STATUS_ACTIVE,
     }
-    await _atomic_modify(lambda data: data["transactions"].append(record))
+    await _persist("transaction", record, lambda data: data["transactions"].append(record))
 
 
 async def _save_request(user_id: int, amount: Decimal, bank: str | None = None):
@@ -313,8 +371,9 @@ async def _save_request(user_id: int, amount: Decimal, bank: str | None = None):
         "amount":  str(amount),
         "bank":    bank,
         "date":    now,
+        "status":  m.STATUS_ACTIVE,
     }
-    await _atomic_modify(lambda data: data["requests"].append(record))
+    await _persist("request", record, lambda data: data["requests"].append(record))
 
 
 async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str,
@@ -330,8 +389,9 @@ async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str,
         "bank":    bank,
         "bank_to": bank_to,
         "date":    now,
+        "status":  m.STATUS_ACTIVE,
     }
-    await _atomic_modify(lambda data: data["transfers"].append(record))
+    await _persist("transfer", record, lambda data: data["transfers"].append(record))
 
 
 def parse_amount(s: str) -> Decimal:
@@ -576,32 +636,34 @@ async def handle_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def _go_to_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    account   = context.user_data["account"]
     direction = context.user_data["direction"]
-
-    # Наличные — поступление
-    if account == "cash" and direction == "income":
-        kb = _reply_kb(CASH_INCOME_CATEGORIES, add_free=True, add_back=True)
-        await update.message.reply_text("Выбери категорию:", reply_markup=kb)
+    if direction == "income":
+        kb = _reply_kb(INCOME_BUTTONS, cols=1, add_back=True)
+        await update.message.reply_text("Откуда деньги?", reply_markup=kb)
         return ST_CHOOSE_CATEGORY
+    kb = _reply_kb(EXPENSE_BUTTONS, add_back=True)
+    await update.message.reply_text("Выбери категорию:", reply_markup=kb)
+    return ST_CHOOSE_CATEGORY
 
-    # Наличные — списание
-    if account == "cash" and direction == "expense":
-        kb = _reply_kb(CASH_EXPENSE_CATEGORIES, add_free=True, add_back=True)
-        await update.message.reply_text("Выбери категорию:", reply_markup=kb)
-        return ST_CHOOSE_CATEGORY
 
-    # Карта — поступление (без категории)
-    if account == "card" and direction == "income":
-        return await _finish(update, context, category=None, note=None)
-
-    # Карта — списание
-    if account == "card" and direction == "expense":
-        kb = _reply_kb(CARD_EXPENSE_CATEGORIES, add_free=True, add_back=True)
-        await update.message.reply_text("Выбери категорию:", reply_markup=kb)
-        return ST_CHOOSE_CATEGORY
-
-    return ConversationHandler.END
+async def _ask_note(update: Update, context: ContextTypes.DEFAULT_TYPE, *, required: bool):
+    context.user_data["note_required"] = required
+    category = context.user_data.get("category")
+    if category == m.CAT_REFUND_15:
+        hint = "Что купили? Это пойдёт в примечание."
+    elif category == m.CAT_DELIVERY_CN:
+        hint = "Что за партия? (или /skip)"
+    elif required:
+        hint = "Напиши примечание:"
+    else:
+        hint = "Добавь пояснение (или /skip):"
+    await update.message.reply_text(
+        hint,
+        reply_markup=ReplyKeyboardMarkup(
+            [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
+        ),
+    )
+    return ST_ENTERING_NOTE
 
 
 async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -609,100 +671,68 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if BTN_CANCEL in text:
         return await cancel(update, context)
 
-    account   = context.user_data["account"]
     direction = context.user_data["direction"]
 
-    # Назад из свободного ввода или подкатегории → обратно к списку категорий
     if BTN_BACK in text:
-        if context.user_data.pop("awaiting_free_category", False) or \
-           context.user_data.pop("awaiting_subcategory", False):
+        if context.user_data.pop("awaiting_subcategory", False):
             context.user_data.pop("category", None)
             return await _go_to_category(update, context)
-        # Назад из главного списка категорий → обратно к вводу суммы
         context.user_data.pop("category", None)
         await update.message.reply_text("Введи сумму:", reply_markup=ReplyKeyboardMarkup(
             [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
         ))
         return ST_ENTERING_AMOUNT
 
-    # Свободный ввод
-    if text == BTN_FREE:
-        await update.message.reply_text(
-            "Напиши свою категорию:",
-            reply_markup=ReplyKeyboardMarkup(
-                [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
-            )
+    if context.user_data.pop("awaiting_subcategory", False):
+        note = (m.strip_emoji(text) or text)[:MAX_NOTE_LEN]
+        return await _finish(
+            update, context,
+            category=context.user_data["category"],
+            note=note,
         )
-        context.user_data["awaiting_free_category"] = True
+
+    if direction == "income":
+        source = _match_named(text, m.INCOME_SOURCES, _income_btn)
+        if source is None:
+            source = m.SRC_OTHER
+            context.user_data["category"] = source
+            return await _finish(update, context, category=source, note=text[:MAX_NOTE_LEN])
+        context.user_data["category"] = source
+        if m.income_followup(source) == m.FOLLOWUP_NOTE_REQUIRED:
+            return await _ask_note(update, context, required=True)
+        return await _finish(update, context, category=source, note=None)
+
+    cat = _match_named(text, m.EXPENSE_CATEGORIES, _expense_btn)
+    if cat is None:
+        await update.message.reply_text("Выбери категорию кнопкой.")
         return ST_CHOOSE_CATEGORY
 
-    if context.user_data.pop("awaiting_free_category", False):
-        category = text[:MAX_NOTE_LEN]
-        context.user_data["category"] = category
-        return await _finish(update, context, category=category, note=None)
-
-    # Карта — списание: подкатегории
-    if account == "card" and direction == "expense":
-        if context.user_data.pop("awaiting_subcategory", False):
-            context.user_data["note"] = text[:MAX_NOTE_LEN]
-            return await _finish(update, context,
-                                  category=context.user_data["category"],
-                                  note=context.user_data["note"])
-
-        if text == CAT_BANK:
-            context.user_data["category"] = text
-            kb = _reply_kb(BANK_SUBCATEGORIES, add_back=True)
-            await update.message.reply_text("Уточни:", reply_markup=kb)
-            context.user_data["awaiting_subcategory"] = True
-            return ST_CHOOSE_CATEGORY
-
-        if text == CAT_DIV:
-            context.user_data["category"] = text
-            kb = _reply_kb(DIVIDEND_SUBCATEGORIES, add_back=True)
-            await update.message.reply_text("Кому?", reply_markup=kb)
-            context.user_data["awaiting_subcategory"] = True
-            return ST_CHOOSE_CATEGORY
-
-        if text == CAT_ZP_WORKERS:
-            context.user_data["category"] = text
-            kb = _reply_kb(WORKERS_SUBCATEGORIES, add_back=True)
-            await update.message.reply_text("Кому и какая часть?", reply_markup=kb)
-            context.user_data["awaiting_subcategory"] = True
-            return ST_CHOOSE_CATEGORY
-
-        if text == CAT_ZP:
-            context.user_data["category"] = text
-            kb = _reply_kb([], add_dates=True, add_back=True)
-            await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
-            return ST_ENTERING_ZP_DATE
-
-        if text in (CAT_OFC, CAT_WH):
-            context.user_data["category"] = text
-            await update.message.reply_text(
-                "Добавь пояснение (или /skip чтобы пропустить):",
-                reply_markup=ReplyKeyboardMarkup(
-                    [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=True
-                )
-            )
-            return ST_ENTERING_NOTE
-
-        if text == CAT_MEAL:
-            return await _finish(update, context, category=text, note=None)
-
-        if text in CARD_EXPENSE_CATEGORIES:
-            context.user_data["category"] = text
-            return await _finish(update, context, category=text, note=None)
-
-    # Наличные — ЗП упаковщиков
-    if text == CAT_ZP:
-        context.user_data["category"] = text
+    context.user_data["category"] = cat
+    follow = m.expense_followup(cat)
+    if follow == m.FOLLOWUP_DATE:
         kb = _reply_kb([], add_dates=True, add_back=True)
-        await update.message.reply_text("Укажи дату выплаты (или нажми «Сегодня»):", reply_markup=kb)
+        await update.message.reply_text(
+            "Укажи дату смены (или нажми «Сегодня»):",
+            reply_markup=kb,
+        )
         return ST_ENTERING_ZP_DATE
-
-    # Все остальные кнопки — сохраняем как категорию без доп. ввода
-    context.user_data["category"] = text[:MAX_NOTE_LEN]
-    return await _finish(update, context, category=context.user_data["category"], note=None)
+    if follow == m.FOLLOWUP_SUB:
+        subs = m.EXPENSE_SUBCATEGORIES[cat]
+        kb = _reply_kb(subs, add_back=True)
+        if cat == m.CAT_DIV:
+            prompt = "Кому?"
+        elif cat == m.CAT_ZP_WORKERS:
+            prompt = "Кому и какая часть?"
+        else:
+            prompt = "Уточни:"
+        await update.message.reply_text(prompt, reply_markup=kb)
+        context.user_data["awaiting_subcategory"] = True
+        return ST_CHOOSE_CATEGORY
+    if follow == m.FOLLOWUP_NOTE_REQUIRED:
+        return await _ask_note(update, context, required=True)
+    if follow == m.FOLLOWUP_NOTE:
+        return await _ask_note(update, context, required=False)
+    return await _finish(update, context, category=cat, note=None)
 
 
 async def handle_zp_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -735,7 +765,13 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if BTN_BACK in text:
         context.user_data.pop("category", None)
         return await _go_to_category(update, context)
-    note = None if text == "/skip" else text[:MAX_NOTE_LEN]
+    if text == "/skip" or not text:
+        if context.user_data.get("note_required"):
+            await update.message.reply_text("Примечание обязательно, напиши текстом.")
+            return ST_ENTERING_NOTE
+        note = None
+    else:
+        note = text[:MAX_NOTE_LEN]
     return await _finish(update, context,
                           category=context.user_data.get("category"),
                           note=note)
@@ -1006,7 +1042,7 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     categories: dict[str, Decimal] = {}
     for t in txs:
         if t["type"] == "expense" and t.get("category"):
-            key = t["category"]
+            key = m.category_for_sheet(t["category"]) or t["category"]
             if t.get("note"):
                 key += f" · {t['note']}"
             categories[key] = categories.get(key, Decimal("0")) + Decimal(t["amount"])
