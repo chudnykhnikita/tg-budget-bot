@@ -1,3 +1,126 @@
-# Agent instructions
+# TG budget bot — инструкции для любого агента
 
-Read `CLAUDE.md` for project rules before work. Before SSH/SCP/deploy, read [SERVER_ACCESS.md](SERVER_ACCESS.md); keep Happ enabled and use its documented direct-interface SSH route. Preserve unrelated workspace changes.
+Прочитай этот файл целиком, затем [`CLAUDE.md`](CLAUDE.md). Перед SSH, SCP или деплоем — [`SERVER_ACCESS.md`](SERVER_ACCESS.md).
+
+Это Telegram-бот подотчёта **ИП Чудных Н.Е.** Деньги — подотчёт (наличные + карта), не склад. Не путать со складским ботом Trade-Plus и с контейнером `my-budget-bot` на том же VPS.
+
+Приоритеты владельца: **точность → простота → красота**.
+
+## 30 секунд
+
+Владелец в Telegram пишет операции. Бот кладёт их в JSON и одновременно в Google Sheet «Бюджет ИП Чудных Н.Е.». Если запись в таблицу не прошла — сохранение в боте отклоняется. JSON — рабочая копия, которую читает бот. Формулы «Сводный» / «Отчет бухгалтеру» считают только строки со статусом **Активна**. После сверки с бухгалтером период закрывают: живые операции уезжают в архив `periods[]`, в открытом журнале остаются стартовые остатки. Вечный лист **Журнал** при закрытии не чистят.
+
+## Стек
+
+Python 3.12, `python-telegram-bot` v21 (async, polling), Google Sheets API, openpyxl, Docker. Тесты: `python3 -m unittest discover -s tests -v`. Линтера и pytest нет.
+
+## Карта файлов
+
+| Файл | Когда открывать |
+|------|-----------------|
+| `budget_bot.py` | Telegram UI, ConversationHandler, persist, Excel-экспорт |
+| `budget_cards.py` | HTML карточек: баланс, отчёт бухгалтеру, история, подтверждение |
+| `tg_rich.py` | `sendRichMessage` + HTML fallback |
+| `budget_map.py` | Категории, имена листов, row↔record, `bank_to`, ledger headers |
+| `sheets_budget.py` | Dual-write в Google Sheets, Журнал, пакетный `_apply_status` |
+| `budget_period.py` | Закрытие периода: `prepare_close` / `apply_close` |
+| `build_budget_sheet.py` | Сборка листов и формул (`--ensure-ledger`) |
+| `proxy_failover.py` | SOCKS5 failover к Telegram |
+| `import_excel_budget.py` | Разовый импорт Excel → JSON |
+| `deploy.sh` | Прод: git pull + docker build + recreate |
+| `Dockerfile` | Образ; каждый новый runtime-`.py` надо `COPY` |
+| `tests/` | unittest: map, cards, period, proxy |
+
+Вложенный каталог `tg-budget-bot/` — чужой слепок, в коммиты не класть.
+
+## JSON (то, что читает бот)
+
+Файл `DATA_FILE` (локально `budget_data.json`, в Docker **обязательно** `/data/budget_data.json`).
+
+```json
+{
+  "transactions": [],
+  "requests": [],
+  "transfers": [],
+  "periods": []
+}
+```
+
+Каждая запись: UUID `id`, `user_id`, `date` (ISO, Москва), `amount` строка `"X.XX"`. Суммы в коде — `Decimal`. На экране `fmt()` округляет до рублей; в JSON и Excel хранится с копейками.
+
+- **transaction**: `account` (`cash`/`card`), `type` (`income`/`expense`), `category`, `note`, `bank` (для карты), `status`.
+- **request**: запрос денег (подотчёт ещё не пришёл).
+- **transfer**: `from`/`to` (`cash`/`card`); наличные→карта пишут `bank_to` (Тиньков), колонка отправителя пустая.
+- **periods**: закрытые журналы. Отчёт, Excel, история и правка смотрят только открытый журнал.
+
+Мягкое удаление: `status = "Удалена"`, строку не стирают. Запись остатка при закрытии: категория `Стартовый остаток` или `долг с прошлого периода`; эти строки в лист **Журнал** не дублируют (кроме первого сида).
+
+Запись идёт через `_atomic_modify(mutator)`: `asyncio.Lock` + tempfile + `os.replace`. Мутатор может вызваться дважды (JSON, затем Sheets) — план кладут в общий `plan_box`. `load_data()` каждый раз гоняет `_migrate()`.
+
+## Google Sheet
+
+Книга: [Бюджет ИП Чудных Н.Е.](https://docs.google.com/spreadsheets/d/1ot1C-aPMHCKqpfn8Sa3ETWhM8uhwp78i8uhmbSI-uwo/edit) (`BUDGET_SHEET_ID`, дефолт в коде тот же). Служебный аккаунт Editor: `budget@protean-bazaar-496812-m5.iam.gserviceaccount.com`. Не трогать складскую «Складская Next».
+
+| Лист | Роль |
+|------|------|
+| Наличные поступления / списания | Операции cash |
+| Карта поступления / списания | Операции card |
+| Запросы, Переводы | То же |
+| **Журнал** | Вечная кассовая книга: Дата, Поступление, Списание, Счёт, Сумма, Категория, Подкатегория, Плавающий баланс, Ключ, Статус. ~10 000 строк → `Журнал 2` |
+| Сводный | Формулы остатков (Активна) |
+| Отчет бухгалтеру | Формулы отчёта |
+| Категории поступлений / списаний | Справочники |
+
+Формулы ru_RU: разделитель `;`. Формат денег: `# ,##0" ₽";-#,##0" ₽";"-"`. Закрытие периода на Sheets — пакетный `_apply_status` (один batchGet + batchUpdate чанками по 100). Построчные delete упираются в 60 reads/min и оставляют «Сводный» отрицательным.
+
+Перевод наличные→карта: банк получателя в `bank_to` / колонка E «Тиньков». Иначе SUMIFS Тинькова не видит пополнение.
+
+Бэкофил Журнала: `python3 build_budget_sheet.py --ensure-ledger` (месячные журналы не чистит).
+
+## Потоки в боте
+
+`edit_conv` регистрируется **первым**, иначе «✏️ Изменить» съедается regex `add_conv`.
+
+Главная клавиатура (≤4 ряда, 2 кнопки, без цвета):
+
+```
+💵 Наличные    💳 Карта
+🔄 Перевод     📨 Запросил
+💰 Баланс      📒 Отчёт
+🕓 История     ✏️ Изменить
+```
+
+❌ — только списание. Отмена — ✖️. Excel только с кнопки отчёта и `/export`, не с баланса.
+
+- Добавление: счёт → направление → сумма → категория → иногда подкатегория/дата/заметка → запись.
+- Правка: тип → направление → список → поле → значение / удаление.
+- Короткий текст — обычные сообщения. Структурированные экраны (баланс, отчёт, история, `/start`, подтверждение) — rich HTML через `tg_rich.py` + `budget_cards.py`.
+
+Подкатегории (пишутся в `note`): банк, дивиденды, ЗП работников — списки; ЗП упаковщиков — дата; офис/склад — свободный текст.
+
+## Команды
+
+```bash
+python budget_bot.py                          # локально, нужен .env
+python3 -m unittest discover -s tests -v
+docker build -t budget-bot .
+./deploy.sh                                   # только после push в origin/main
+python3 build_budget_sheet.py --ensure-ledger
+```
+
+`.env`: `TELEGRAM_BOT_TOKEN`, `DATA_FILE`, `PROXY_URL`, `PROXY_URL_BACKUP`, `GOOGLE_CREDENTIALS_FILE`, `BUDGET_SHEET_ID`.
+
+Прод: контейнер `budget-bot`, код `/opt/tg-budget-bot`, том `/opt/budget-bot-data`. `deploy.sh` видит только запушенный `main`. Смена `.env` на сервере — recreate контейнера, не `docker restart`. SSH: Happ включён, `ssh -o 'ProxyCommand=nc -b en0 %h %p' root@83.166.245.224`.
+
+Закрытие периода: `/close`, `/clear`, или кнопка в отчёте.
+
+## Правила работы
+
+- Меняй только то, что просили. Чужие правки в дереве не откатывай.
+- Секреты (`.env`, `credentials.json`, токены) не коммить и не печатай.
+- Тестовые сообщения владельцу в Telegram не слать, пока не попросили.
+- Warehouse payroll / Mini App / складскую таблицу не трогать, пока не попросили.
+- На сервере не трогать `my-budget-bot` и чужие контейнеры.
+- Новые модули: файл + `COPY` в Dockerfile + тест в `tests/`.
+- Не мержить sample xlsx из `примеры бюджетов…`, пока не сказали, какой файл актуален.
+- Не чистить лист Журнал при закрытии периода.

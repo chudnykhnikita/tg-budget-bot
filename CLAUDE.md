@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Operating notes for coding agents in this repository. Start with [`AGENTS.md`](AGENTS.md). Before SSH/SCP/deploy, read [`SERVER_ACCESS.md`](SERVER_ACCESS.md).
 
 ## Running the bot
 
@@ -8,63 +8,79 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Local dev (requires .env with TELEGRAM_BOT_TOKEN)
 python budget_bot.py
 
-# Docker (production)
+# Tests
+python3 -m unittest discover -s tests -v
+
+# Docker (production image)
 docker build -t budget-bot .
 docker run -d --env-file .env -v budget_data:/data budget-bot
 ```
 
 `.env` variables:
+
 - `TELEGRAM_BOT_TOKEN` — required
-- `DATA_FILE` — path to JSON storage. Defaults to a `budget_data.json` next to `budget_bot.py` (i.e. `/app/budget_data.json` in the container) — **not** `/data`. In Docker this must be set explicitly to `/data/budget_data.json` to land on the mounted volume, or the bot will silently start from an empty file.
-- `PROXY_URL` — optional primary SOCKS5 proxy for Telegram
-- `PROXY_URL_BACKUP` — optional second SOCKS5 proxy
+- `DATA_FILE` — JSON storage. Defaults to `budget_data.json` next to `budget_bot.py` (i.e. `/app/budget_data.json` in the container) — **not** `/data`. In Docker set `/data/budget_data.json` or the bot starts from an empty file.
+- `PROXY_URL` / `PROXY_URL_BACKUP` — optional SOCKS5 for Telegram
+- `GOOGLE_CREDENTIALS_FILE` — service account JSON; dual-write to Sheets when set
+- `BUDGET_SHEET_ID` — defaults to workbook «Бюджет ИП Чудных Н.Е.»
 
-The bot checks configured proxies at startup, then keeps all configured routes available at runtime. Both regular Bot API calls and `getUpdates` can fail over to the next proxy, then direct connectivity, on connection-stage errors. Polling also retries other transport failures because `getUpdates` is safe to repeat. For other Bot API methods, ambiguous read/write failures switch the active route for the next call without replaying a potentially completed action. When a fallback is active, the bot periodically checks whether a configured proxy has recovered. Bot API HTTP errors such as `409 Conflict` do not trigger proxy failover. Proxy labels are logged without credentials.
-
-There are no tests or a linter configured.
+The bot checks configured proxies at startup and keeps all routes. Bot API calls and `getUpdates` fail over: next proxy, then direct. Polling retries other transport failures because `getUpdates` is safe to repeat. For other methods, ambiguous failures switch the route without replaying a maybe-completed action. HTTP errors such as `409 Conflict` do not trigger failover. Proxy labels are logged without credentials.
 
 ## Deployment
 
-Production runs on a remote VPS as the `budget-bot` Docker container, deployed via `./deploy.sh` (`git pull` + `docker build` + recreate container on the server). This only picks up commits that have been **pushed to `origin/main`** — local commits not yet pushed are invisible to the server. `deploy.sh` also only rebuilds the image; if `.env` on the server changes (new/renamed variable), the container must be recreated (`docker rm` + `docker run --env-file .env ...`), not just `docker restart`, or the old env stays in effect.
+Production is the `budget-bot` Docker container on the VPS, via `./deploy.sh` (`git pull` + `docker build` + recreate). Only commits **pushed to `origin/main`** reach the server. If `.env` on the server changes, recreate the container (`docker rm` + `docker run --env-file .env ...`); `docker restart` keeps the old env.
+
+Image `COPY` lines in `Dockerfile` list every runtime module. A new `.py` imported by the bot must be added there.
+
+SSH: Happ on, `ProxyCommand=nc -b en0 %h %p`, host `root@83.166.245.224`. Do not touch `my-budget-bot` or other projects on that host.
 
 ## Architecture
 
-The bot is `python-telegram-bot` v21. Structured screens (balance, accountant report, history, save confirm, `/start`) go through `tg_rich.py` (`sendRichMessage` + HTML fallback) and `budget_cards.py`. Short prompts stay regular messages. Two `ConversationHandler` state machines are registered on the `Application`:
+`python-telegram-bot` v21. Structured screens (balance, accountant report, history, save confirm, `/start`) go through `tg_rich.py` (`sendRichMessage` + HTML fallback) and `budget_cards.py`. Short prompts stay regular messages.
 
-- **`edit_conv`** (registered first) — inline-keyboard flow for browsing, editing, and deleting existing records. States `EDIT_CHOOSE_TYPE` → `EDIT_CHOOSE_DIRECTION` → `EDIT_LIST` → `EDIT_CHOOSE_FIELD` → `EDIT_ENTERING_VALUE` / `EDIT_CONFIRM_DELETE`.
-- **`add_conv`** (registered second) — reply-keyboard flow for recording new transactions. States `ST_CHOOSE_ACCOUNT` → `ST_CHOOSE_DIRECTION` → `ST_ENTERING_AMOUNT` → `ST_CHOOSE_CATEGORY` → optional sub-states (`ST_ENTERING_ZP_DATE`, `ST_ENTERING_NOTE`) → save.
+Two `ConversationHandler`s on the `Application`:
 
-`edit_conv` must remain first in `app.add_handler(...)` order so the "✏️ Изменить" button isn't swallowed by `add_conv`'s `main_filter` regex.
+- **`edit_conv`** (registered first) — inline-keyboard browse/edit/delete. States `EDIT_CHOOSE_TYPE` → `EDIT_CHOOSE_DIRECTION` → `EDIT_LIST` → `EDIT_CHOOSE_FIELD` → `EDIT_ENTERING_VALUE` / `EDIT_CONFIRM_DELETE`.
+- **`add_conv`** (registered second) — reply-keyboard new records. States `ST_CHOOSE_ACCOUNT` → `ST_CHOOSE_DIRECTION` → `ST_ENTERING_AMOUNT` → `ST_CHOOSE_CATEGORY` → optional `ST_ENTERING_ZP_DATE` / `ST_ENTERING_NOTE` → save.
+
+`edit_conv` must stay first so «✏️ Изменить» is not swallowed by `add_conv`'s `main_filter`. Reply keyboard: uncoloured, ≤4 rows, 2 per row. ❌ is write-off only; cancel is ✖️. Excel is not attached to every balance — only `📒 Отчёт` and `/export`.
 
 ## Data layer
 
-All persistence is a single JSON file with arrays `transactions`, `requests`, `transfers` (the **open** journal) and `periods` (closed journals). Every record carries a UUID `id`, `user_id`, ISO-formatted `date` (Moscow time), and `amount` stored as a decimal string `"X.XX"`. When `GOOGLE_CREDENTIALS_FILE` is set, the bot also writes the same record to Google Sheets and refuses the save if the sheet write fails. JSON remains the copy the running bot reads.
+JSON arrays: `transactions`, `requests`, `transfers` (open journal) and `periods` (closed). Every record has UUID `id`, `user_id`, Moscow ISO `date`, amount as `"X.XX"`. With `GOOGLE_CREDENTIALS_FILE` the same record is written to Google Sheets; a sheet failure refuses the save. The running bot reads JSON.
 
-After the accountant accepts an Excel, close the period (`📒 Отчёт` → «Закрыть период», or `/close` / `/clear`): live ops move into `periods`, and the new journal starts from the remainder (`Стартовый остаток` or `долг с прошлого периода`). Report, Excel, history, and edit use the open journal only, so the next file does not repeat the previous month.
+After the accountant accepts Excel, close the period (`📒 Отчёт` → «Закрыть период», or `/close` / `/clear`): live ops move into `periods`, the new journal starts from remainder (`Стартовый остаток` or `долг с прошлого периода`). Report, Excel, history, and edit use the open journal only.
 
-Google Sheet tab `Журнал` is a perpetual cash book (Дата, Поступление, Списание, Счёт, Сумма, Категория, Подкатегория, Плавающий баланс). Period close does not clear it. Remainder rows are not written there — the last running balance is the carry. At ~10 000 rows the bot creates `Журнал 2` with a transfer-of-balance row. Create/backfill the tab with `python3 build_budget_sheet.py --ensure-ledger` (does not wipe monthly journals).
+Tab `Журнал` is a perpetual cash book (Дата, Поступление, Списание, Счёт, Сумма, Категория, Подкатегория, Плавающий баланс). Period close does not clear it. Remainder rows are not written there. At ~10 000 rows the bot creates `Журнал 2`. Backfill: `python3 build_budget_sheet.py --ensure-ledger` (does not wipe monthly journals). Soft-delete is status `Удалена`. Period close must batch-mark archived ids (`_apply_status`); per-row deletes hit Sheets quota and leave Сводный negative.
+
+Cash→card transfers store the destination bank in `bank_to` (column E, «Тиньков»). Column D is the sender bank and is empty for cash.
 
 Key rules:
-- All writes go through `_atomic_modify(mutator)`, which holds a global `asyncio.Lock` and writes via `tempfile + os.replace` to prevent corruption.
-- `load_data()` runs `_migrate()` on every read — idempotently backfills `id`, `account`, `note`, and normalises amounts for records written before the current schema.
-- Amounts everywhere are `Decimal`; the `fmt()` helper rounds to whole roubles for display (not for storage or Excel).
-- `_strip_emoji()` is applied only when writing to Excel — emoji stay in JSON and in bot messages.
+
+- Writes go through `_atomic_modify(mutator)`: global `asyncio.Lock`, `tempfile` + `os.replace`.
+- `load_data()` runs `_migrate()` every read — backfills `id`, `account`, `note`, amounts.
+- Amounts are `Decimal`; `fmt()` rounds to whole roubles for display only.
+- `_strip_emoji()` only when writing Excel — emoji stay in JSON and bot messages.
 
 ## Categories and subcategory flow
 
-Categories are module-level string constants (with emoji prefixes). Certain card-expense categories trigger a subcategory prompt before `_finish()`:
-- `CAT_BANK` → `BANK_SUBCATEGORIES` (stored as `note`)
-- `CAT_DIV` → `DIVIDEND_SUBCATEGORIES` (stored as `note`)
-- `CAT_ZP_WORKERS` → `WORKERS_SUBCATEGORIES` (stored as `note`)
-- `CAT_ZP` → date picker (`ST_ENTERING_ZP_DATE`), date stored as `note`
-- `CAT_OFC` / `CAT_WH` → free-text note prompt (`ST_ENTERING_NOTE`)
+Module-level string constants in `budget_map.py` (emoji prefixes in the bot UI). Card-expense categories that prompt before `_finish()`:
 
-`handle_category` uses `context.user_data` flags (`awaiting_free_category`, `awaiting_subcategory`, `awaiting_zp_date`) to route the *next* message in the same state.
+- `CAT_BANK` → `BANK_SUBCATEGORIES` (stored as `note`)
+- `CAT_DIV` → `DIVIDEND_SUBCATEGORIES` (`note`)
+- `CAT_ZP_WORKERS` → `WORKERS_SUBCATEGORIES` (`note`)
+- `CAT_ZP` → date picker (`ST_ENTERING_ZP_DATE`), date as `note`
+- `CAT_OFC` / `CAT_WH` → free-text note (`ST_ENTERING_NOTE`)
+
+`handle_category` uses `context.user_data` flags (`awaiting_free_category`, `awaiting_subcategory`, `awaiting_zp_date`) to route the next message in the same state.
 
 ## Excel export
 
-`export_excel()` builds a 6-sheet workbook (openpyxl): cash income, cash expenses, card income, card expenses, requests, transfers. It exports the **open** journal only. Balance (`💰 Баланс`) is a rich card without Excel. The accountant report (`📒 Отчёт`) and `/export` attach the file. Cancel on keyboards is `✖️ Отмена` (❌ is write-off only).
+`export_excel()` builds a 6-sheet workbook: cash income, cash expenses, card income, card expenses, requests, transfers. Open journal only. Balance (`💰 Баланс`) is a rich card without Excel.
 
-## SSH с включённым Happ
+## Do not
 
-Перед SSH, SCP или деплоем на `83.166.245.224` читать [SERVER_ACCESS.md](SERVER_ACCESS.md). Использовать проверенный прямой маршрут через `en0`, сохраняя Happ включённым.
+- Commit `.env`, `credentials.json`, `budget_data.json`, or the nested `tg-budget-bot/` tree.
+- Send test Telegram messages to the owner unless asked.
+- Deploy warehouse payroll or Mini App unless asked.
+- Merge sample xlsx from `примеры бюджетов…` into live data unless asked which file is current.

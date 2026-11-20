@@ -1,0 +1,6 @@
+---
+description: TG budget bot — start here
+alwaysApply: true
+---
+
+Read root `AGENTS.md`, then `CLAUDE.md`. Before SSH/SCP/deploy read `SERVER_ACCESS.md`. This is the personal-finance Telegram bot (подотчёт), not Trade-Plus warehouse.
