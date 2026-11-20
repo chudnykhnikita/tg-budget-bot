@@ -97,6 +97,30 @@ class BudgetMapTests(unittest.TestCase):
         self.assertEqual(back["to"], "cash")
         self.assertEqual(back["amount"], "16000.00")
         self.assertEqual(back["bank"], "tinkoff")
+        self.assertIsNone(back["bank_to"])
+
+    def test_cash_to_card_writes_destination_bank(self):
+        rec = {
+            "id": "t2",
+            "amount": "142205.00",
+            "from": "cash",
+            "to": "card",
+            "bank": "tinkoff",
+            "bank_to": None,
+            "date": "2026-10-24 12:00",
+        }
+        rec = m.normalize_transfer(rec)
+        self.assertIsNone(rec["bank"])
+        self.assertEqual(rec["bank_to"], "tinkoff")
+        row = m.transfer_to_row(rec)
+        self.assertEqual(row[2], "Наличные → Карта")
+        self.assertEqual(row[3], "")
+        self.assertEqual(row[4], "Тиньков")
+        back = m.row_to_transfer(row)
+        self.assertEqual(back["from"], "cash")
+        self.assertEqual(back["to"], "card")
+        self.assertEqual(back["bank_to"], "tinkoff")
+        self.assertIsNone(back["bank"])
 
     def test_deleted_row_is_skipped(self):
         row = ["2026-07-01", 100, "Тиньков", m.SRC_TRADE, "", "id", m.STATUS_DELETED]

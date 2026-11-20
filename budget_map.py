@@ -226,6 +226,20 @@ def bank_label(bank: str | None) -> str:
     return BANK_LABELS.get(bank, bank)
 
 
+def normalize_transfer(record: dict) -> dict:
+    """Cash has no bank; the card side of a transfer always has a bank."""
+    rec = dict(record)
+    src = rec.get("from")
+    dst = rec.get("to")
+    if src == "cash" and dst == "card":
+        rec["bank_to"] = rec.get("bank_to") or rec.get("bank") or BANK_TINKOFF
+        rec["bank"] = None
+    elif src == "card" and dst == "cash":
+        rec["bank"] = rec.get("bank") or BANK_TINKOFF
+        rec["bank_to"] = None
+    return rec
+
+
 def bank_key(label: str | None) -> str | None:
     if not label:
         return None
@@ -400,15 +414,16 @@ def request_to_row(record: dict) -> list:
 
 
 def transfer_to_row(record: dict) -> list:
+    rec = normalize_transfer(record)
     return [
-        date_only(record.get("date")),
-        float(parse_amount(record.get("amount"))),
-        direction_label(record.get("from") or "card", record.get("to") or "cash"),
-        bank_label(record.get("bank")),
-        bank_label(record.get("bank_to")),
-        record.get("id") or "",
-        record.get("status") or STATUS_ACTIVE,
-        record.get("user_id") or "",
+        date_only(rec.get("date")),
+        float(parse_amount(rec.get("amount"))),
+        direction_label(rec.get("from") or "card", rec.get("to") or "cash"),
+        bank_label(rec.get("bank")),
+        bank_label(rec.get("bank_to")),
+        rec.get("id") or "",
+        rec.get("status") or STATUS_ACTIVE,
+        rec.get("user_id") or "",
     ]
 
 

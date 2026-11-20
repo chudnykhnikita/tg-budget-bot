@@ -164,19 +164,43 @@ def _update_row(sheet: str, row_number: int, row: list) -> None:
 
 
 def _set_status(sheet: str, key: str, status: str) -> bool:
-    row_number = _find_row(sheet, key)
-    if row_number is None:
-        return False
-    _, status_idx = _key_status(sheet)
-    letter = _col_letter(status_idx)
-    _service().spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=f"'{sheet}'!{letter}{row_number}",
-        valueInputOption="RAW",
-        body={"values": [[status]]},
+    return _apply_status({key}, status, sheets=[sheet]) > 0
+
+
+def _apply_status(keys: set[str], status: str, sheets: list[str] | None = None) -> int:
+    """Mark matching Ключ rows in one batchGet + batchUpdate. Same id may sit
+    on a monthly tab and on Журнал — both are updated."""
+    if not keys:
+        return 0
+    titles = sheets if sheets is not None else list(KEY_STATUS.keys()) + _ledger_titles()
+    ranges = []
+    meta = []
+    for title in titles:
+        key_idx, status_idx = _key_status(title)
+        ranges.append(f"'{title}'!{_col_letter(key_idx)}:{_col_letter(status_idx)}")
+        meta.append((title, status_idx))
+    result = _service().spreadsheets().values().batchGet(
+        spreadsheetId=SHEET_ID, ranges=ranges
     ).execute()
-    _invalidate()
-    return True
+    payload = []
+    for (title, status_idx), block in zip(meta, result.get("valueRanges", [])):
+        letter = _col_letter(status_idx)
+        for i, row in enumerate(block.get("values") or [], start=1):
+            if not row:
+                continue
+            if str(row[0]) in keys:
+                payload.append({
+                    "range": f"'{title}'!{letter}{i}",
+                    "values": [[status]],
+                })
+    for i in range(0, len(payload), 100):
+        _service().spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"valueInputOption": "RAW", "data": payload[i:i + 100]},
+        ).execute()
+    if payload:
+        _invalidate()
+    return len(payload)
 
 
 def _sheet_titles() -> list[str]:
@@ -369,26 +393,18 @@ def replace_transfer(record: dict) -> None:
 
 
 def delete_by_id(kind: str, key: str) -> bool:
-    found = False
     if kind == "requests":
-        return _set_status(m.SHEET_REQUESTS, key, m.STATUS_DELETED)
-    if kind == "transfers":
-        found = _set_status(m.SHEET_TRANSFERS, key, m.STATUS_DELETED)
+        sheets = [m.SHEET_REQUESTS]
+    elif kind == "transfers":
+        sheets = [m.SHEET_TRANSFERS] + _ledger_titles()
     else:
-        for sheet in (
+        sheets = [
             m.SHEET_OPS_CARD_IN,
             m.SHEET_OPS_CARD_OUT,
             m.SHEET_OPS_CASH_IN,
             m.SHEET_OPS_CASH_OUT,
-        ):
-            if _set_status(sheet, key, m.STATUS_DELETED):
-                found = True
-                break
-    for title in _ledger_titles():
-        if _set_status(title, key, m.STATUS_DELETED):
-            found = True
-            break
-    return found
+        ] + _ledger_titles()
+    return _apply_status({key}, m.STATUS_DELETED, sheets=sheets) > 0
 
 
 def _rows(block: dict | None) -> list[list]:
@@ -461,27 +477,23 @@ def modify(mutator: Callable[[dict], Any]) -> dict:
                 append_transaction(rec)
             elif rec != before["transactions"][key]:
                 replace_transaction(rec)
-        for key in before["transactions"]:
-            if key not in after_tx:
-                delete_by_id("transactions", key)
-
         for key, rec in after_rq.items():
             if key not in before["requests"]:
                 append_request(rec)
             elif rec != before["requests"][key]:
                 replace_request(rec)
-        for key in before["requests"]:
-            if key not in after_rq:
-                delete_by_id("requests", key)
-
         for key, rec in after_tr.items():
             if key not in before["transfers"]:
                 append_transfer(rec)
             elif rec != before["transfers"][key]:
                 replace_transfer(rec)
-        for key in before["transfers"]:
-            if key not in after_tr:
-                delete_by_id("transfers", key)
+
+        gone = set()
+        gone.update(k for k in before["transactions"] if k not in after_tx)
+        gone.update(k for k in before["requests"] if k not in after_rq)
+        gone.update(k for k in before["transfers"] if k not in after_tr)
+        if gone:
+            _apply_status(gone, m.STATUS_DELETED)
 
         _invalidate()
         return load_data()

@@ -189,7 +189,7 @@ def _money_col(sheet_id: int, col: int) -> dict:
                 "startColumnIndex": col,
                 "endColumnIndex": col + 1,
             },
-            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";(#,##0" ₽");"-"'}}},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";"-"'}}},
             "fields": "userEnteredFormat.numberFormat",
         }
     }
@@ -428,14 +428,14 @@ def write_summary(svc, ids: dict[str, int]) -> None:
         {
             "repeatCell": {
                 "range": {"sheetId": sid, "startRowIndex": 4, "endRowIndex": 20, "startColumnIndex": 1, "endColumnIndex": 2},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";(#,##0" ₽");"-"'}}},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";"-"'}}},
                 "fields": "userEnteredFormat.numberFormat",
             }
         },
         {
             "repeatCell": {
                 "range": {"sheetId": sid, "startRowIndex": 23, "endRowIndex": 23 + len(m.EXPENSE_CATEGORIES), "startColumnIndex": 1, "endColumnIndex": 2},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";(#,##0" ₽");"-"'}}},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";"-"'}}},
                 "fields": "userEnteredFormat.numberFormat",
             }
         },
@@ -508,7 +508,7 @@ def write_report(svc, ids: dict[str, int]) -> None:
             {
                 "repeatCell": {
                     "range": {"sheetId": sid, "startRowIndex": 2, "endRowIndex": 12 + n, "startColumnIndex": 1, "endColumnIndex": 2},
-                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";(#,##0" ₽");"-"'}}},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";"-"'}}},
                     "fields": "userEnteredFormat.numberFormat",
                 }
             }

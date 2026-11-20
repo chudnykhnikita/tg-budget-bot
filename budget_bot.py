@@ -390,9 +390,9 @@ async def _save_request(user_id: int, amount: Decimal, bank: str | None = None):
 
 async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str,
                           bank: str | None = None, bank_to: str | None = None):
-    """src/dst: 'cash' или 'card'. bank — банк-отправитель, bank_to — банк-получатель (карта→карта)."""
+    """src/dst: 'cash' или 'card'. bank — банк-отправитель, bank_to — банк-получатель."""
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
-    record = {
+    record = m.normalize_transfer({
         "id":      str(uuid.uuid4()),
         "user_id": user_id,
         "amount":  str(amount),
@@ -402,7 +402,7 @@ async def _save_transfer(user_id: int, amount: Decimal, src: str, dst: str,
         "bank_to": bank_to,
         "date":    now,
         "status":  m.STATUS_ACTIVE,
-    }
+    })
     await _persist("transfer", record, lambda data: data["transfers"].append(record))
 
 
@@ -898,9 +898,12 @@ async def handle_transfer_dir(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ST_CHOOSE_TRANSFER_DIR
 
     context.user_data["flow"] = "transfer"
-    context.user_data["bank"] = BANK_TINKOFF
-    if context.user_data["transfer"]["from"] == "card" and context.user_data["transfer"]["to"] == "card":
+    tr = context.user_data["transfer"]
+    context.user_data["bank"] = BANK_TINKOFF if tr["from"] == "card" else None
+    if tr["to"] == "card":
         context.user_data["bank_to"] = BANK_TINKOFF
+    else:
+        context.user_data.pop("bank_to", None)
     await update.message.reply_text(
         "Введи сумму перевода:",
         reply_markup=ReplyKeyboardMarkup(
