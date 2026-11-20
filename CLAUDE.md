@@ -38,7 +38,11 @@ The bot is `python-telegram-bot` v21. Structured screens (balance, accountant re
 
 ## Data layer
 
-All persistence is a single JSON file with three top-level arrays: `transactions`, `requests`, `transfers`. Every record carries a UUID `id`, `user_id`, ISO-formatted `date` (Moscow time), and `amount` stored as a decimal string `"X.XX"`. When `GOOGLE_CREDENTIALS_FILE` is set, the bot also writes the same record to Google Sheets and refuses the save if the sheet write fails. JSON remains the copy the running bot reads.
+All persistence is a single JSON file with arrays `transactions`, `requests`, `transfers` (the **open** journal) and `periods` (closed journals). Every record carries a UUID `id`, `user_id`, ISO-formatted `date` (Moscow time), and `amount` stored as a decimal string `"X.XX"`. When `GOOGLE_CREDENTIALS_FILE` is set, the bot also writes the same record to Google Sheets and refuses the save if the sheet write fails. JSON remains the copy the running bot reads.
+
+After the accountant accepts an Excel, close the period (`📒 Отчёт` → «Закрыть период», or `/close` / `/clear`): live ops move into `periods`, and the new journal starts from the remainder (`Стартовый остаток` or `долг с прошлого периода`). Report, Excel, history, and edit use the open journal only, so the next file does not repeat the previous month.
+
+Google Sheet tab `Журнал` is a perpetual cash book (Дата, Поступление, Списание, Счёт, Сумма, Категория, Подкатегория, Плавающий баланс). Period close does not clear it. Remainder rows are not written there — the last running balance is the carry. At ~10 000 rows the bot creates `Журнал 2` with a transfer-of-balance row. Create/backfill the tab with `python3 build_budget_sheet.py --ensure-ledger` (does not wipe monthly journals).
 
 Key rules:
 - All writes go through `_atomic_modify(mutator)`, which holds a global `asyncio.Lock` and writes via `tempfile + os.replace` to prevent corruption.
@@ -59,7 +63,7 @@ Categories are module-level string constants (with emoji prefixes). Certain card
 
 ## Excel export
 
-`export_excel()` builds a 6-sheet workbook (openpyxl): cash income, cash expenses, card income, card expenses, requests, transfers. Balance (`💰 Баланс`) is a rich card without Excel. The accountant report (`📒 Отчёт`) and `/export` attach the file. Cancel on keyboards is `✖️ Отмена` (❌ is write-off only).
+`export_excel()` builds a 6-sheet workbook (openpyxl): cash income, cash expenses, card income, card expenses, requests, transfers. It exports the **open** journal only. Balance (`💰 Баланс`) is a rich card without Excel. The accountant report (`📒 Отчёт`) and `/export` attach the file. Cancel on keyboards is `✖️ Отмена` (❌ is write-off only).
 
 ## SSH с включённым Happ
 

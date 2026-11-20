@@ -43,6 +43,7 @@ KEY_STATUS = {
     m.SHEET_REQUESTS: (4, 5),
     m.SHEET_TRANSFERS: (5, 6),
 }
+LEDGER_KEY_STATUS = (8, 9)
 
 READ_RANGES = [
     f"'{m.SHEET_OPS_CARD_IN}'!A:H",
@@ -88,6 +89,12 @@ def _col_letter(index: int) -> str:
     return "".join(reversed(letters))
 
 
+def _key_status(sheet: str) -> tuple[int, int]:
+    if m.ledger_index(sheet) is not None:
+        return LEDGER_KEY_STATUS
+    return KEY_STATUS[sheet]
+
+
 def _last_row(sheet: str) -> int:
     res = _service().spreadsheets().values().get(
         spreadsheetId=SHEET_ID, range=f"'{sheet}'!A:A"
@@ -103,11 +110,21 @@ def _balance_formula(row_number: int) -> str:
     return f'=IF(B{row_number}="";"";SUMIFS($B$2:B{row_number};$H$2:H{row_number};"Активна"))'
 
 
+def _ledger_balance_formula(row_number: int) -> str:
+    return (
+        f'=IF(E{row_number}="";"";'
+        f'SUMIFS($B$2:B{row_number};$J$2:J{row_number};"Активна")'
+        f'-SUMIFS($C$2:C{row_number};$J$2:J{row_number};"Активна"))'
+    )
+
+
 def _append(sheet: str, row: list) -> int:
     start = _last_row(sheet) + 1
     values = list(row)
     if sheet in (m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT) and len(values) > 5:
         values[5] = _balance_formula(start)
+    if m.ledger_index(sheet) is not None and len(values) > 7:
+        values[7] = _ledger_balance_formula(start)
     values = ["" if v is None else v for v in values]
     end = _col_letter(len(values) - 1)
     rng = f"'{sheet}'!A{start}:{end}{start}"
@@ -122,7 +139,7 @@ def _append(sheet: str, row: list) -> int:
 
 
 def _find_row(sheet: str, key: str) -> int | None:
-    key_idx, _ = KEY_STATUS[sheet]
+    key_idx, _ = _key_status(sheet)
     letter = _col_letter(key_idx)
     res = _service().spreadsheets().values().get(
         spreadsheetId=SHEET_ID, range=f"'{sheet}'!{letter}:{letter}"
@@ -150,7 +167,7 @@ def _set_status(sheet: str, key: str, status: str) -> bool:
     row_number = _find_row(sheet, key)
     if row_number is None:
         return False
-    _, status_idx = KEY_STATUS[sheet]
+    _, status_idx = _key_status(sheet)
     letter = _col_letter(status_idx)
     _service().spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
@@ -162,9 +179,155 @@ def _set_status(sheet: str, key: str, status: str) -> bool:
     return True
 
 
+def _sheet_titles() -> list[str]:
+    meta = _service().spreadsheets().get(
+        spreadsheetId=SHEET_ID, fields="sheets.properties.title,sheets.properties.sheetId"
+    ).execute()
+    return [s["properties"]["title"] for s in meta.get("sheets", [])]
+
+
+def _ledger_titles() -> list[str]:
+    found = []
+    for title in _sheet_titles():
+        idx = m.ledger_index(title)
+        if idx is not None:
+            found.append((idx, title))
+    found.sort()
+    return [title for _, title in found]
+
+
+def _add_ledger_sheet(title: str) -> None:
+    _service().spreadsheets().batchUpdate(
+        spreadsheetId=SHEET_ID,
+        body={"requests": [{"addSheet": {"properties": {
+            "title": title,
+            "gridProperties": {"rowCount": m.LEDGER_MAX_ROWS, "columnCount": len(m.LEDGER_HEADERS)},
+        }}}]},
+    ).execute()
+    _service().spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range=f"'{title}'!A1:J1",
+        valueInputOption="RAW",
+        body={"values": [m.LEDGER_HEADERS]},
+    ).execute()
+    _invalidate()
+
+
+def _last_ledger_balance(sheet: str) -> float:
+    last = _last_row(sheet)
+    if last < 2:
+        return 0.0
+    res = _service().spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"'{sheet}'!H{last}",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    values = res.get("values") or []
+    if not values or not values[0]:
+        return 0.0
+    try:
+        return float(values[0][0])
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def current_ledger_sheet() -> str:
+    titles = _ledger_titles()
+    if not titles:
+        _add_ledger_sheet(m.SHEET_LEDGER)
+        return m.SHEET_LEDGER
+    current = titles[-1]
+    if _last_row(current) < m.LEDGER_MAX_ROWS - 10:
+        return current
+    nxt = m.ledger_title((m.ledger_index(current) or 1) + 1)
+    if nxt not in titles:
+        balance = _last_ledger_balance(current)
+        _add_ledger_sheet(nxt)
+        carry = [
+            datetime_date(),
+            balance if balance >= 0 else "",
+            abs(balance) if balance < 0 else "",
+            "—",
+            abs(balance),
+            "Перенос с предыдущего листа",
+            current,
+            None,
+            f"ledger-carry-{nxt}",
+            m.STATUS_ACTIVE,
+        ]
+        _append(nxt, carry)
+    return nxt
+
+
+def datetime_date() -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d")
+
+
+def _find_ledger_row(key: str) -> tuple[str, int] | None:
+    for title in _ledger_titles():
+        row_number = _find_row(title, key)
+        if row_number is not None:
+            return title, row_number
+    return None
+
+
+def seed_ledger(data: dict) -> int:
+    """Write open txs/transfers into an empty journal. Skips if rows already exist."""
+    sheet = current_ledger_sheet()
+    if _last_row(sheet) > 1:
+        return 0
+    items = []
+    for rec in data.get("transactions") or []:
+        if rec.get("status") == m.STATUS_DELETED:
+            continue
+        items.append((rec.get("date") or "", "transaction", rec))
+    for rec in data.get("transfers") or []:
+        if rec.get("status") == m.STATUS_DELETED:
+            continue
+        items.append((rec.get("date") or "", "transfer", rec))
+    items.sort(key=lambda item: item[0])
+    payload = []
+    for i, (_, kind, rec) in enumerate(items, start=2):
+        row = m.ledger_row_from_tx(rec) if kind == "transaction" else m.ledger_row_from_transfer(rec)
+        row[7] = _ledger_balance_formula(i)
+        payload.append(["" if v is None else v for v in row])
+    if payload:
+        end = _col_letter(len(m.LEDGER_HEADERS) - 1)
+        _service().spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"'{sheet}'!A2:{end}{len(payload) + 1}",
+            valueInputOption="USER_ENTERED",
+            body={"values": payload},
+        ).execute()
+        _invalidate()
+    return len(payload)
+
+
+def _sync_ledger(kind: str, record: dict, *, skip_carry: bool = True) -> None:
+    if skip_carry and kind == "transaction" and m.is_period_carry(record):
+        return
+    if kind == "transaction":
+        row = m.ledger_row_from_tx(record)
+    else:
+        row = m.ledger_row_from_transfer(record)
+    key = record.get("id") or ""
+    found = _find_ledger_row(key) if key else None
+    if found:
+        sheet, row_number = found
+        if m.ledger_index(sheet) is not None and len(row) > 7:
+            row[7] = _ledger_balance_formula(row_number)
+        _update_row(sheet, row_number, row)
+        return
+    sheet = current_ledger_sheet()
+    _append(sheet, row)
+
+
 def append_transaction(record: dict) -> None:
     sheet, row = m.transaction_to_row(record)
     _append(sheet, row)
+    _sync_ledger("transaction", record)
 
 
 def append_request(record: dict) -> None:
@@ -173,6 +336,7 @@ def append_request(record: dict) -> None:
 
 def append_transfer(record: dict) -> None:
     _append(m.SHEET_TRANSFERS, m.transfer_to_row(record))
+    _sync_ledger("transfer", record)
 
 
 def replace_transaction(record: dict) -> None:
@@ -180,8 +344,9 @@ def replace_transaction(record: dict) -> None:
     row_number = _find_row(sheet, record["id"])
     if row_number is None:
         _append(sheet, row)
-        return
-    _update_row(sheet, row_number, row)
+    else:
+        _update_row(sheet, row_number, row)
+    _sync_ledger("transaction", record)
 
 
 def replace_request(record: dict) -> None:
@@ -198,24 +363,32 @@ def replace_transfer(record: dict) -> None:
     row = m.transfer_to_row(record)
     if row_number is None:
         _append(m.SHEET_TRANSFERS, row)
-        return
-    _update_row(m.SHEET_TRANSFERS, row_number, row)
+    else:
+        _update_row(m.SHEET_TRANSFERS, row_number, row)
+    _sync_ledger("transfer", record)
 
 
 def delete_by_id(kind: str, key: str) -> bool:
+    found = False
     if kind == "requests":
         return _set_status(m.SHEET_REQUESTS, key, m.STATUS_DELETED)
     if kind == "transfers":
-        return _set_status(m.SHEET_TRANSFERS, key, m.STATUS_DELETED)
-    for sheet in (
-        m.SHEET_OPS_CARD_IN,
-        m.SHEET_OPS_CARD_OUT,
-        m.SHEET_OPS_CASH_IN,
-        m.SHEET_OPS_CASH_OUT,
-    ):
-        if _set_status(sheet, key, m.STATUS_DELETED):
-            return True
-    return False
+        found = _set_status(m.SHEET_TRANSFERS, key, m.STATUS_DELETED)
+    else:
+        for sheet in (
+            m.SHEET_OPS_CARD_IN,
+            m.SHEET_OPS_CARD_OUT,
+            m.SHEET_OPS_CASH_IN,
+            m.SHEET_OPS_CASH_OUT,
+        ):
+            if _set_status(sheet, key, m.STATUS_DELETED):
+                found = True
+                break
+    for title in _ledger_titles():
+        if _set_status(title, key, m.STATUS_DELETED):
+            found = True
+            break
+    return found
 
 
 def _rows(block: dict | None) -> list[list]:

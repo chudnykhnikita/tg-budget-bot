@@ -11,6 +11,7 @@ COPY budget_map.py .
 COPY sheets_budget.py .
 COPY tg_rich.py .
 COPY budget_cards.py .
+COPY budget_period.py .
 
 RUN mkdir -p /data
 

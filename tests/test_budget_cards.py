@@ -58,6 +58,33 @@ class BudgetCardsTests(unittest.TestCase):
         self.assertEqual(snap["cash_sales_month"], Decimal("2500.00"))
         self.assertEqual(snap["cash_bal"], Decimal("46500.00"))
 
+    def test_card_opening_is_not_card_inflow(self):
+        data = {
+            "transactions": [
+                _tx(
+                    id="open",
+                    type="income",
+                    account="card",
+                    amount="94.00",
+                    category=m.SRC_OPENING,
+                    date="2026-11-20 15:00",
+                ),
+                _tx(
+                    id="trade",
+                    type="income",
+                    account="card",
+                    amount="100000.00",
+                    category=m.SRC_TRADE,
+                    date="2026-11-21 10:00",
+                ),
+            ],
+            "requests": [],
+            "transfers": [],
+        }
+        snap = cards.build_snapshot(data, 1, now=NOW)
+        self.assertEqual(snap["card_in"], Decimal("100000.00"))
+        self.assertEqual(snap["card_bal"], Decimal("100094.00"))
+
     def test_expenses_group_by_sheet_category_not_note(self):
         data = {
             "transactions": [

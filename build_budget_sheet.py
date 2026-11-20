@@ -550,10 +550,64 @@ def import_json(svc, path: Path) -> None:
         ).execute()
 
 
+def ensure_ledger(svc, ids: dict[str, int], *, backfill: bool) -> dict[str, int]:
+    """Create the perpetual journal tab. Never clears existing journal rows."""
+    if m.SHEET_LEDGER not in ids:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=store.SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {
+                "title": m.SHEET_LEDGER,
+                "gridProperties": {
+                    "rowCount": m.LEDGER_MAX_ROWS,
+                    "columnCount": len(m.LEDGER_HEADERS),
+                },
+            }}}]},
+        ).execute()
+        ids = _ids(_meta(svc))
+        print("создан лист:", m.SHEET_LEDGER)
+    svc.spreadsheets().values().update(
+        spreadsheetId=store.SHEET_ID,
+        range=f"'{m.SHEET_LEDGER}'!A1:J1",
+        valueInputOption="RAW",
+        body={"values": [m.LEDGER_HEADERS]},
+    ).execute()
+    sid = ids[m.SHEET_LEDGER]
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=store.SHEET_ID,
+        body={"requests": [
+            {"updateSheetProperties": {
+                "properties": {
+                    "sheetId": sid,
+                    "gridProperties": {
+                        "rowCount": m.LEDGER_MAX_ROWS,
+                        "columnCount": len(m.LEDGER_HEADERS),
+                        "frozenRowCount": 1,
+                    },
+                },
+                "fields": "gridProperties",
+            }},
+            {"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": NAVY,
+                    "textFormat": {"foregroundColor": GOLD, "bold": True},
+                }},
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+            }},
+        ]},
+    ).execute()
+    if backfill and JSON_PATH.exists():
+        data = json.loads(JSON_PATH.read_text(encoding="utf-8"))
+        n = store.seed_ledger(data)
+        print(f"журнал: {n} строк" if n else "журнал уже заполнен, пропуск")
+    return ids
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--import-json", action="store_true")
     parser.add_argument("--layout-only", action="store_true")
+    parser.add_argument("--ensure-ledger", action="store_true")
     args = parser.parse_args()
     if not store.configured():
         print(
@@ -577,6 +631,10 @@ def main() -> int:
         return 1
     ids = _ids(meta)
     ids = rename_report(svc, ids)
+    if args.ensure_ledger:
+        ensure_ledger(svc, ids, backfill=True)
+        print("Готово:", store.sheet_url())
+        return 0
     _clear_filters_and_groups(svc, meta)
     needed = list(HEADERS) + [m.SHEET_SUMMARY, m.SHEET_REPORT, m.SHEET_INCOME_CATS, m.SHEET_EXPENSE_CATS]
     missing = [name for name in needed if name not in ids]

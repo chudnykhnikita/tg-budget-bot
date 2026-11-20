@@ -156,7 +156,7 @@ def build_snapshot(data: dict, user_id: int, *, now: datetime | None = None) -> 
             income_lines.append(t)
             if account == "cash" and source == m.SRC_SALE:
                 cash_sales += amount
-            if account == "card":
+            if account == "card" and source != m.SRC_OPENING:
                 card_in += amount
         elif t.get("type") == "expense":
             cat = m.category_for_sheet(t.get("category")) or t.get("category") or m.CAT_OTHER_EXP

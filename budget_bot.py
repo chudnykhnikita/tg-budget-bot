@@ -34,6 +34,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import budget_map as m
 import budget_cards
+import budget_period
 import tg_rich as rich_msg
 
 try:
@@ -192,7 +193,7 @@ _lock = asyncio.Lock()
 # ---------------------------------------------------------------------------
 
 def _empty_data() -> dict:
-    return {"transactions": [], "requests": [], "transfers": []}
+    return {"transactions": [], "requests": [], "transfers": [], "periods": []}
 
 
 def _migrate(data: dict) -> dict:
@@ -200,6 +201,7 @@ def _migrate(data: dict) -> dict:
     data.setdefault("transactions", [])
     data.setdefault("requests", [])
     data.setdefault("transfers", [])
+    data.setdefault("periods", [])
 
     # Транзакции до cash/card-разделения: дополняем id/account/note/bank,
     # подстраховываемся от отсутствующего type, нормализуем amount к "X.XX".
@@ -1015,7 +1017,10 @@ async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     markup = MAIN_KEYBOARD
     if not snap["empty"]:
         markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📎 Excel", callback_data="acct_excel")]]
+            [
+                [InlineKeyboardButton("📎 Excel", callback_data="acct_excel")],
+                [InlineKeyboardButton("🔒 Закрыть период", callback_data="close_ask")],
+            ]
         )
     await _send_card(update, budget_cards.report_html(snap), reply_markup=markup)
 
@@ -1688,37 +1693,62 @@ async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# /clear
+# Закрытие периода (/clear и кнопка в отчёте)
 # ---------------------------------------------------------------------------
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🗑 Да, удалить всё", callback_data="clear_yes"),
-        InlineKeyboardButton("Отмена",             callback_data="clear_no"),
+def _close_kb():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔒 Закрыть", callback_data="close_yes"),
+        InlineKeyboardButton("✖️ Отмена", callback_data="close_no"),
     ]])
-    await update.message.reply_text("Точно удалить ВСЕ свои операции? Это необратимо.", reply_markup=kb)
 
 
-async def clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _ask_close_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = await asyncio.to_thread(load_data)
+    plan = budget_period.prepare_close(data, update.effective_user.id)
+    if not plan.ok:
+        target = update.effective_message
+        await target.reply_text(plan.reason, reply_markup=MAIN_KEYBOARD)
+        return
+    await _send_card(update, budget_period.preview_html(plan), reply_markup=_close_kb())
+
+
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _ask_close_period(update, context)
+
+
+async def close_period_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "clear_yes":
-        user_id = update.effective_user.id
+    if query.data == "close_no":
+        await query.message.reply_text("✖️ Период не закрыт.", reply_markup=MAIN_KEYBOARD)
+        return
+    if query.data == "close_ask":
+        await _ask_close_period(update, context)
+        return
 
-        def mutate(data):
-            data["transactions"] = [t for t in data["transactions"] if t.get("user_id") != user_id]
-            data["requests"]     = [r for r in data["requests"]     if r.get("user_id") != user_id]
-            data["transfers"]    = [t for t in data["transfers"]    if t.get("user_id") != user_id]
+    user_id = update.effective_user.id
+    plan_box: dict = {}
 
-        try:
-            await _atomic_modify(mutate)
-        except OSError:
-            logger.exception("Failed to clear user data")
-            await query.edit_message_text("⚠️ Не удалось очистить, попробуй ещё раз.")
-            return
-        await query.edit_message_text("🗑 Все твои данные удалены.")
-    else:
-        await query.edit_message_text("Отменено.")
+    def mutate(data):
+        plan = plan_box.setdefault("plan", budget_period.prepare_close(data, user_id))
+        budget_period.apply_close(data, plan)
+
+    try:
+        await _atomic_modify(mutate)
+    except OSError:
+        logger.exception("Failed to close period")
+        await query.message.reply_text("⚠️ Не удалось закрыть период, попробуй ещё раз.", reply_markup=MAIN_KEYBOARD)
+        return
+    plan = plan_box.get("plan")
+    if plan is None or not plan.ok:
+        await query.message.reply_text(plan.reason if plan else "Закрывать нечего.", reply_markup=MAIN_KEYBOARD)
+        return
+    await query.message.reply_text(
+        f"🔒 Период {plan.period_label} закрыт. В новый журнал перешёл остаток {fmt(plan.total)} ₽.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    await _send_card(update, budget_cards.balance_html(await _snapshot_for(update)))
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1859,8 +1889,9 @@ def main():
 
     app.add_handler(CommandHandler("export", export_excel))
     app.add_handler(CommandHandler("clear",  clear))
+    app.add_handler(CommandHandler("close",  clear))
     app.add_handler(CallbackQueryHandler(export_excel_button, pattern="^acct_excel$"))
-    app.add_handler(CallbackQueryHandler(clear_confirm, pattern="^clear_"))
+    app.add_handler(CallbackQueryHandler(close_period_button, pattern="^close_(ask|yes|no)$"))
     # edit_conv ставим первым: чтобы кнопка «✏️ Изменить» захватывалась им,
     # а не общей add_conv (которая иначе съест регекспом из main_filter).
     app.add_handler(edit_conv)
