@@ -300,22 +300,46 @@ def report_html(snap: dict) -> str:
     if snap["empty"]:
         return empty_html("📒 Отчёт", "Операций пока нет — бухгалтеру пока нечего отдавать.")
     title = snap["period_label"] or snap["month_label"]
-    kpis = [
-        ["Выручка наличными", money_cell(snap["cash_sales"])],
-        ["Пополнения карты", money_cell(snap["card_in"])],
-        ["Расходы", money_cell(snap["exp_total"])],
-    ]
-    if snap["has_requests"]:
-        kpis.append(["Осталось по запросам", money_cell(snap["req_remaining"], signed=True)])
-    kpis += [
-        ["Наличные на конец", money_cell(snap["cash_bal"])],
-        ["Карты на конец", money_cell(snap["card_bal"])],
-        ["<b>Всего денег</b>", f"<b>{money_cell(snap['total'])}</b>"],
+    summary = [
+        [
+            "Наличные",
+            money_cell(snap["cash_inc"]),
+            money_cell(snap["cash_exp"]),
+            money_cell(snap["cash_tr_net"], signed=True),
+            money_cell(snap["cash_bal"]),
+        ],
+        [
+            "Карта",
+            money_cell(snap["card_inc"]),
+            money_cell(snap["card_exp"]),
+            money_cell(snap["card_tr_net"], signed=True),
+            money_cell(snap["card_bal"]),
+        ],
+        [
+            "<b>Всего</b>",
+            f"<b>{money_cell(snap['cash_inc'] + snap['card_inc'])}</b>",
+            f"<b>{money_cell(snap['exp_total'])}</b>",
+            "",
+            f"<b>{money_cell(snap['total'])}</b>",
+        ],
     ]
     body = [
         f"<h3>📒 Отчёт · {esc(title)}</h3>",
-        table(["Показатель", "Сумма"], kpis),
+        table(
+            ["Счёт", "Поступления", "Списания", "Переводы", "Баланс"],
+            summary,
+            align=["l", "r", "r", "r", "r"],
+        ),
     ]
+    if snap["has_requests"]:
+        body.append(table(
+            ["Запросы", "Сумма"],
+            [
+                ["Запрошено", money_cell(snap["req_total"])],
+                ["Пришло на карту", money_cell(snap["req_got"])],
+                ["Осталось", money_cell(snap["req_remaining"], signed=True)],
+            ],
+        ))
     if snap["income_rows"]:
         income_tbl = [
             [esc(source), esc(_account_label(account)), money_cell(amount)]

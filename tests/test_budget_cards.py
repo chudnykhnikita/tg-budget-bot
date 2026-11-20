@@ -158,14 +158,56 @@ class BudgetCardsTests(unittest.TestCase):
             "transfers": [],
         }
         html = cards.report_html(cards.build_snapshot(data, 1, now=NOW))
-        self.assertIn("Выручка наличными", html)
-        self.assertIn("Пополнения карты", html)
-        self.assertIn("Осталось по запросам", html)
+        self.assertIn("Поступления", html)
+        self.assertIn("Списания", html)
+        self.assertIn("Переводы", html)
+        self.assertIn("Осталось", html)
         self.assertIn("Откуда пришло", html)
         self.assertIn("Куда ушло", html)
         self.assertIn("Продажа товара", html)
         self.assertIn("Плата банку", html)
         self.assertIn("Комиссия", html)
+        self.assertIn("2 500", html)
+
+    def test_report_totals_match_accountant_cash_book(self):
+        data = {
+            "transactions": [
+                _tx(id="open", type="income", account="cash", amount="19000", category="остаток", bank=None),
+                _tx(id="alex", type="income", account="cash", amount="420000", category=m.SRC_ALEXEY, bank=None),
+                _tx(id="other", type="income", account="cash", amount="123205", category=m.SRC_OTHER, note="Темрюк", bank=None),
+                _tx(id="trade", type="income", account="card", amount="150000", category=m.SRC_TRADE),
+                _tx(id="cash-exp", type="expense", account="cash", amount="162500", category=m.CAT_ZP_WORKERS, bank=None),
+                _tx(id="card-exp", type="expense", account="card", amount="442111", category=m.CAT_ZP),
+            ],
+            "requests": [],
+            "transfers": [
+                {
+                    "id": "tr",
+                    "user_id": 1,
+                    "amount": "292205.00",
+                    "from": "cash",
+                    "to": "card",
+                    "bank": "tinkoff",
+                    "date": "2026-11-10 10:00",
+                    "status": m.STATUS_ACTIVE,
+                }
+            ],
+        }
+        snap = cards.build_snapshot(data, 1, now=NOW)
+        self.assertEqual(snap["cash_inc"], Decimal("562205.00"))
+        self.assertEqual(snap["cash_exp"], Decimal("162500.00"))
+        self.assertEqual(snap["cash_tr_net"], Decimal("-292205.00"))
+        self.assertEqual(snap["cash_bal"], Decimal("107500.00"))
+        self.assertEqual(snap["card_inc"], Decimal("150000.00"))
+        self.assertEqual(snap["card_exp"], Decimal("442111.00"))
+        self.assertEqual(snap["card_tr_net"], Decimal("292205.00"))
+        self.assertEqual(snap["card_bal"], Decimal("94.00"))
+        self.assertEqual(snap["total"], Decimal("107594.00"))
+        html = cards.report_html(snap)
+        self.assertIn("562 205", html)
+        self.assertIn("107 500", html)
+        self.assertIn("107 594", html)
+        self.assertNotIn("Выручка наличными", html)
 
     def test_report_covers_open_period_not_calendar_month(self):
         data = {
