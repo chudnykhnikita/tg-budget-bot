@@ -4,6 +4,7 @@ import json
 import logging
 import asyncio
 import tempfile
+import time
 import uuid
 import warnings
 from datetime import datetime, date, timedelta
@@ -187,6 +188,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 _lock = asyncio.Lock()
+_payroll_checked = 0.0
+_PAYROLL_INTERVAL = 15.0
 
 # ---------------------------------------------------------------------------
 # Работа с данными
@@ -267,6 +270,34 @@ def load_data() -> dict:
     return _migrate(data)
 
 
+def _load_fresh() -> dict:
+    """JSON плюс выплаты zp:, которые склад записал только в таблицу."""
+    global _payroll_checked
+    data = load_data()
+    now = time.monotonic()
+    if (
+        sheets_store is None
+        or not sheets_store.configured()
+        or now - _payroll_checked < _PAYROLL_INTERVAL
+    ):
+        return data
+    try:
+        rows = sheets_store.external_payroll()
+    except Exception:
+        logger.exception("Не удалось прочитать выплаты zp: из таблицы")
+        return data
+    _payroll_checked = now
+    if m.merge_payroll(data, rows):
+        _save_data_sync(data)
+        logger.info("В журнал дописаны выплаты упаковщиков из таблицы")
+    return data
+
+
+async def _locked_load() -> dict:
+    async with _lock:
+        return await asyncio.to_thread(_load_fresh)
+
+
 def _save_data_sync(data: dict):
     """Синхронная атомарная запись через временный файл + os.replace.
     НЕ берёт лок — для использования из под уже захваченного _lock."""
@@ -318,7 +349,7 @@ async def _atomic_modify(mutator, *, mirror_sheet: bool = True):
     """Атомарно: load → mutator(data) → save. Под одним локом —
     защищает от гонок между конкурентными write-операциями."""
     async with _lock:
-        data = await asyncio.to_thread(load_data)
+        data = await asyncio.to_thread(_load_fresh)
         mutator(data)
         if (
             mirror_sheet
@@ -491,7 +522,7 @@ async def _send_card(update: Update, html: str, reply_markup=MAIN_KEYBOARD):
 
 
 async def _snapshot_for(update: Update) -> dict:
-    data = await asyncio.to_thread(load_data)
+    data = await _locked_load()
     return budget_cards.build_snapshot(data, update.effective_user.id)
 
 
@@ -1042,7 +1073,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE,
                        _data: dict | None = None):
     if _data is None:
-        _data = await asyncio.to_thread(load_data)
+        _data = await _locked_load()
     user_id = update.effective_user.id
     txs     = [t for t in _data["transactions"] if t["user_id"] == user_id]
     reqs    = [r for r in _data["requests"]     if r["user_id"] == user_id]
@@ -1260,7 +1291,7 @@ async def _edit_render_direction_picker(query, account: str):
 
 async def _edit_render_list(query, context, user_id: int):
     flt  = context.user_data["edit_filter"]
-    data = await asyncio.to_thread(load_data)
+    data = await _locked_load()
     items = _edit_get_filtered(data, user_id, flt)
     is_request  = flt["type"] == "requests"
     is_transfer = flt["type"] == "transfers"
@@ -1508,7 +1539,7 @@ async def edit_list_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flt     = context.user_data["edit_filter"]
         is_req  = flt["type"] == "requests"
         is_tr   = flt["type"] == "transfers"
-        data    = await asyncio.to_thread(load_data)
+        data    = await _locked_load()
         coll    = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == item_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
@@ -1539,7 +1570,7 @@ async def edit_field_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tx_id  = context.user_data.get("edit_tx_id")
         is_req = context.user_data.get("edit_is_request", False)
         is_tr  = context.user_data.get("edit_is_transfer", False)
-        data   = await asyncio.to_thread(load_data)
+        data   = await _locked_load()
         coll   = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == tx_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
@@ -1576,7 +1607,7 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
         tx_id  = context.user_data.get("edit_tx_id")
         is_req = context.user_data.get("edit_is_request", False)
         is_tr  = context.user_data.get("edit_is_transfer", False)
-        data   = await asyncio.to_thread(load_data)
+        data   = await _locked_load()
         coll   = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == tx_id), None)
         if item is None or item["user_id"] != update.effective_user.id:
@@ -1707,7 +1738,7 @@ def _close_kb():
 
 
 async def _ask_close_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await asyncio.to_thread(load_data)
+    data = await _locked_load()
     plan = budget_period.prepare_close(data, update.effective_user.id)
     if not plan.ok:
         target = update.effective_message

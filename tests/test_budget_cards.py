@@ -267,6 +267,24 @@ class BudgetCardsTests(unittest.TestCase):
         self.assertIn(m.SRC_OPENING, html)
         self.assertIn("Продажа товара", html)
 
+    def test_packer_pay_shows_the_name(self):
+        data = {
+            "transactions": [
+                _tx(
+                    category=m.CAT_ZP,
+                    note="Ярослав Фурсов · 23.11.2026",
+                    amount="5000",
+                    account="card",
+                    type="expense",
+                ),
+            ],
+            "requests": [],
+            "transfers": [],
+        }
+        html = cards.history_html(cards.build_snapshot(data, 1, now=NOW))
+        self.assertIn("Карта · ЗП · Ярослав Фурсов", html)
+        self.assertNotIn("…", html)
+
     def test_user_text_is_escaped(self):
         data = {
             "transactions": [

@@ -239,6 +239,49 @@ class BudgetMapTests(unittest.TestCase):
             "type": "expense", "account": "card", "category": m.CAT_BANK,
         }))
 
+    def test_payroll_row_becomes_card_expense(self):
+        row = [
+            "23.11.2026", "5\xa0000 ₽", "ЗП упаковщиков",
+            "Ярослав Фурсов · 23.11.2026", "Тиньков", "5\xa0000 ₽",
+            "zp:e272ef4ec826335c", "Активна", "236305027",
+        ]
+        rec = m.payroll_tx_from_expense_row(m.SHEET_OPS_CARD_OUT, row)
+        self.assertEqual(rec["id"], "zp:e272ef4ec826335c")
+        self.assertEqual(rec["amount"], "5000.00")
+        self.assertEqual(rec["account"], "card")
+        self.assertEqual(rec["bank"], "tinkoff")
+        self.assertEqual(rec["category"], "ЗП упаковщиков")
+        self.assertEqual(rec["user_id"], 236305027)
+        self.assertEqual(rec["date"], "2026-11-23 12:00")
+        self.assertIsNone(m.payroll_tx_from_expense_row(m.SHEET_OPS_CARD_OUT, ["2026-11-23", 10, "Прочее", "", "Тиньков", "", "uuid", "Активна", 1]))
+
+    def test_merge_payroll_adds_missing_and_voids(self):
+        fresh = m.payroll_tx_from_expense_row(m.SHEET_OPS_CARD_OUT, [
+            "23.11.2026", "5000", "ЗП упаковщиков", "Ярослав", "Тиньков", "",
+            "zp:new", "Активна", "7",
+        ])
+        gone = dict(fresh)
+        gone["id"] = "zp:gone"
+        gone["status"] = m.STATUS_DELETED
+        archived = dict(fresh)
+        archived["id"] = "zp:old"
+        data = {
+            "transactions": [{
+                "id": "zp:live",
+                "status": m.STATUS_ACTIVE,
+                "amount": "100.00",
+            }],
+            "periods": [{"transactions": [{"id": "zp:old"}]}],
+        }
+        live_void = dict(fresh)
+        live_void["id"] = "zp:live"
+        live_void["status"] = m.STATUS_DELETED
+        self.assertTrue(m.merge_payroll(data, [fresh, gone, archived, live_void]))
+        ids = [t["id"] for t in data["transactions"]]
+        self.assertEqual(ids, ["zp:live", "zp:new"])
+        self.assertEqual(data["transactions"][0]["status"], m.STATUS_DELETED)
+        self.assertFalse(m.merge_payroll(data, [fresh, gone, archived, live_void]))
+
     def test_ledger_titles(self):
         self.assertEqual(m.ledger_title(1), "Журнал")
         self.assertEqual(m.ledger_title(2), "Журнал 2")

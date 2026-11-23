@@ -422,8 +422,12 @@ def _event_row(kind: str, rec: dict) -> list[str]:
         signed = amount
     else:
         what = m.category_for_sheet(rec.get("category")) or rec.get("category") or "Списание"
-        if rec.get("note"):
-            what = f"{what} · {rec['note']}"
+        note = (rec.get("note") or "").strip()
+        if what == m.CAT_ZP and note:
+            name = note.split(" · ", 1)[0].strip()
+            what = f"ЗП · {name}" if name else "ЗП упаковщиков"
+        elif note:
+            what = f"{what} · {note}"
         signed = -amount
     if len(what) > 36:
         what = what[:35] + "…"

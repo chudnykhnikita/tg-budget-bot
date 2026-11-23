@@ -415,6 +415,28 @@ def _rows(block: dict | None) -> list[list]:
     return values[1:]
 
 
+def external_payroll() -> list[dict]:
+    """Выплаты zp: с листов списаний. Пустой список, если таблицы нет."""
+    if not configured():
+        return []
+    ranges = [
+        f"'{m.SHEET_OPS_CARD_OUT}'!A:I",
+        f"'{m.SHEET_OPS_CASH_OUT}'!A:I",
+    ]
+    result = _service().spreadsheets().values().batchGet(
+        spreadsheetId=SHEET_ID,
+        ranges=ranges,
+        valueRenderOption="FORMATTED_VALUE",
+    ).execute()
+    found = []
+    for sheet, block in zip((m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT), result.get("valueRanges", [])):
+        for row in _rows(block):
+            item = m.payroll_tx_from_expense_row(sheet, row)
+            if item:
+                found.append(item)
+    return found
+
+
 def load_data() -> dict:
     global _cache
     with _lock:
