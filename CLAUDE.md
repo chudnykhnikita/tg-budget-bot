@@ -2,6 +2,10 @@
 
 Operating notes for coding agents in this repository. Start with [`AGENTS.md`](AGENTS.md). Before SSH/SCP/deploy, read [`SERVER_ACCESS.md`](SERVER_ACCESS.md).
 
+## Перед задачей
+
+Загрузить актуальную версию с GitHub: `git status`, затем `git pull --ff-only`, если нет незакоммиченных файлов. Незакоммиченное не перезаписывать и не сбрасывать. Если копия расходится с GitHub, сказать об этом до правок.
+
 ## Running the bot
 
 ```bash
