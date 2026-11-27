@@ -289,22 +289,6 @@ LEDGER_HEADERS = [
     "Ключ",
     "Статус",
 ]
-LEDGER_MAX_ROWS = 10000
-
-
-def ledger_title(index: int) -> str:
-    return SHEET_LEDGER if index <= 1 else f"{SHEET_LEDGER} {index}"
-
-
-def ledger_index(title: str) -> int | None:
-    if title == SHEET_LEDGER:
-        return 1
-    prefix = SHEET_LEDGER + " "
-    if title.startswith(prefix):
-        tail = title[len(prefix):].strip()
-        if tail.isdigit():
-            return int(tail)
-    return None
 
 
 def is_period_carry(record: dict) -> bool:
@@ -313,51 +297,6 @@ def is_period_carry(record: dict) -> bool:
     if record.get("type") == "expense":
         return (category_for_sheet(record.get("category")) or "") == CAT_PRIOR_DEBT
     return False
-
-
-def _ledger_account(record: dict) -> str:
-    account = "Наличные" if record.get("account") == "cash" else "Карта"
-    if record.get("account") == "card" and record.get("bank"):
-        return f"{account} · {bank_label(record.get('bank'))}"
-    return account
-
-
-def ledger_row_from_tx(record: dict) -> list:
-    amount = float(parse_amount(record.get("amount")))
-    income = amount if record.get("type") == "income" else ""
-    expense = amount if record.get("type") == "expense" else ""
-    if record.get("type") == "income":
-        category = income_source_for_sheet(record.get("account") or "card", record.get("category"))
-    else:
-        category = category_for_sheet(record.get("category")) or record.get("category") or CAT_OTHER_EXP
-    return [
-        date_only(record.get("date")),
-        income,
-        expense,
-        _ledger_account(record),
-        amount,
-        category,
-        strip_emoji(record.get("note")),
-        None,
-        record.get("id") or "",
-        record.get("status") or STATUS_ACTIVE,
-    ]
-
-
-def ledger_row_from_transfer(record: dict) -> list:
-    amount = float(parse_amount(record.get("amount")))
-    return [
-        date_only(record.get("date")),
-        "",
-        "",
-        direction_label(record.get("from") or "card", record.get("to") or "cash"),
-        amount,
-        "Перевод",
-        "",
-        None,
-        record.get("id") or "",
-        record.get("status") or STATUS_ACTIVE,
-    ]
 
 
 def tx_sheet(account: str, t_type: str) -> str:

@@ -522,64 +522,95 @@ def import_json(svc, path: Path) -> None:
         ).execute()
 
 
-def ensure_ledger(svc, ids: dict[str, int], *, backfill: bool) -> dict[str, int]:
-    """Create the perpetual journal tab. Never clears existing journal rows."""
+def _ledger_block(sheet: str, order: int, kind: str) -> str:
+    """Строки одного листа в формате «Журнала» (11 столбцов: 10 видимых + порядок + номер строки).
+    Перенесённые остатки берём только в самый первый день бюджета (`first`): в вечной книге
+    каждое закрытие иначе посчитало бы деньги второй раз."""
+    r = lambda col: f"'{sheet}'!{col}2:{col}"
+    if kind == "in":   # Дата, Сумма, Банк, Источник, Примечание, Ключ, Статус
+        cols = [r("A"), r("B"), f"{r('B')}*0", "Наличные" if "Налич" in sheet else None, r("B"), r("D"), r("E"), r("F"), r("G")]
+        status, carry = r("G"), f"({r('D')}<>{_q(m.SRC_OPENING)})"
+    elif kind == "out":   # Дата, Сумма, Категория, Подкатегория, Банк, Баланс, Ключ, Статус
+        cols = [r("A"), f"{r('B')}*0", r("B"), "Наличные" if "Налич" in sheet else None, r("B"), r("C"), r("D"), r("G"), r("H")]
+        status, carry = r("H"), f"({r('C')}<>{_q(m.CAT_PRIOR_DEBT)})"
+    else:   # Переводы: Дата, Сумма, Направление, Банк отправителя, Банк получателя, Ключ, Статус
+        cols = [r("A"), f"{r('B')}*0", f"{r('B')}*0", r("C"), r("B"), f"IF({r('A')}<>\"\";\"Перевод\";\"\")",
+                f"{r('D')}&IF(({r('D')}<>\"\")*({r('E')}<>\"\");\" → \";\"\")&{r('E')}", r("F"), r("G")]
+        status, carry = r("G"), "TRUE"
+    if cols[3] is None:   # карта: «Карта · Тиньков»
+        bank = r("C") if kind == "in" else r("E")
+        cols[3] = f"\"Карта\"&IF({bank}<>\"\";\" · \"&{bank};\"\")"
+    elif not str(cols[3]).startswith(("'", '"')) and kind != "tr":
+        cols[3] = f"IF({r('A')}<>\"\";{_q(cols[3])};\"\")"
+    cols += [f"{r('B')}*0+{order}", f"ROW({r('A')})"]
+    cond = (f"({r('A')}<>\"\")*({r('B')}<>\"\")*({status}<>{_q(m.STATUS_DELETED)})"
+            f"*(({carry})+({r('A')}=first)>0)")
+    return f"IFNA(FILTER(HSTACK({';'.join(cols)});{cond});blank)"
+
+
+def ledger_formula() -> str:
+    """«Журнал» — вечная кассовая книга формулой (27.11.2026): все строки «Активна» и «Архив» листов
+    поступлений, списаний и переводов по дате; «Плавающий баланс» — деньги всего (наличные + карта)
+    после строки. Боты сюда не пишут."""
+    ci, ki, co, ko, tr = (m.SHEET_OPS_CASH_IN, m.SHEET_OPS_CARD_IN, m.SHEET_OPS_CASH_OUT,
+                          m.SHEET_OPS_CARD_OUT, m.SHEET_TRANSFERS)
+    mins = ";".join(
+        f"MINIFS('{t}'!A2:A;'{t}'!B2:B;\"<>\";'{t}'!{st}2:{st};\"<>{m.STATUS_DELETED}\")"
+        for t, st in ((ci, "G"), (ki, "G"), (co, "H"), (ko, "H"))
+    )
+    blocks = ";".join([
+        _ledger_block(ci, 1, "in"), _ledger_block(ki, 2, "in"), _ledger_block(tr, 3, "tr"),
+        _ledger_block(co, 4, "out"), _ledger_block(ko, 5, "out"),
+    ])
+    return (
+        "=ARRAYFORMULA(LET("
+        f"d;VSTACK({mins});first;MIN(FILTER(d;d>0));"
+        "blank;MAKEARRAY(1;11;LAMBDA(r;c;\"\"));"
+        f"all;VSTACK({blocks});"
+        "rows;FILTER(all;CHOOSECOLS(all;1)<>\"\");"
+        "s;SORT(rows;1;TRUE;10;TRUE;11;TRUE);"
+        "bal;SCAN(0;CHOOSECOLS(s;2)-CHOOSECOLS(s;3);LAMBDA(a;x;a+x));"
+        "HSTACK(CHOOSECOLS(s;1;2;3;4;5;6;7);bal;CHOOSECOLS(s;8;9))))"
+    )
+
+
+def write_ledger(svc, ids: dict[str, int]) -> None:
+    """Заменяет «Журнал» формулой. Старые записанные строки стираются — их заменяет формула."""
     if m.SHEET_LEDGER not in ids:
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=store.SHEET_ID,
-            body={"requests": [{"addSheet": {"properties": {
-                "title": m.SHEET_LEDGER,
-                "gridProperties": {
-                    "rowCount": m.LEDGER_MAX_ROWS,
-                    "columnCount": len(m.LEDGER_HEADERS),
-                },
-            }}}]},
-        ).execute()
+        svc.spreadsheets().batchUpdate(spreadsheetId=store.SHEET_ID, body={"requests": [{"addSheet": {
+            "properties": {"title": m.SHEET_LEDGER}}}]}).execute()
         ids = _ids(_meta(svc))
-        print("создан лист:", m.SHEET_LEDGER)
-    svc.spreadsheets().values().update(
-        spreadsheetId=store.SHEET_ID,
-        range=f"'{m.SHEET_LEDGER}'!A1:J1",
-        valueInputOption="RAW",
-        body={"values": [m.LEDGER_HEADERS]},
-    ).execute()
     sid = ids[m.SHEET_LEDGER]
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=store.SHEET_ID,
-        body={"requests": [
-            {"updateSheetProperties": {
-                "properties": {
-                    "sheetId": sid,
-                    "gridProperties": {
-                        "rowCount": m.LEDGER_MAX_ROWS,
-                        "columnCount": len(m.LEDGER_HEADERS),
-                        "frozenRowCount": 1,
-                    },
-                },
-                "fields": "gridProperties",
-            }},
-            {"repeatCell": {
-                "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1},
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": NAVY,
-                    "textFormat": {"foregroundColor": GOLD, "bold": True},
-                }},
-                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
-            }},
-        ]},
+    svc.spreadsheets().values().clear(spreadsheetId=store.SHEET_ID, range=f"'{m.SHEET_LEDGER}'!A1:Z").execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=store.SHEET_ID, range=f"'{m.SHEET_LEDGER}'!A1", valueInputOption="USER_ENTERED",
+        body={"values": [m.LEDGER_HEADERS, [ledger_formula()]]},
     ).execute()
-    if backfill and JSON_PATH.exists():
-        data = json.loads(JSON_PATH.read_text(encoding="utf-8"))
-        n = store.seed_ledger(data)
-        print(f"журнал: {n} строк" if n else "журнал уже заполнен, пропуск")
-    return ids
+
+    def fmt(c0, c1, cell, fields, r0=1, r1=None):
+        rng = {"sheetId": sid, "startRowIndex": r0, "startColumnIndex": c0, "endColumnIndex": c1}
+        if r1 is not None:
+            rng["endRowIndex"] = r1
+        return {"repeatCell": {"range": rng, "cell": {"userEnteredFormat": cell}, "fields": f"userEnteredFormat({fields})"}}
+    hide0 = {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";""'}}
+    svc.spreadsheets().batchUpdate(spreadsheetId=store.SHEET_ID, body={"requests": [
+        {"updateSheetProperties": {"properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 1}},
+                                   "fields": "gridProperties.frozenRowCount"}},
+        fmt(0, 10, {}, "backgroundColor,textFormat,numberFormat"),   # сброс оформления старых записанных строк
+        fmt(0, 10, {"backgroundColor": NAVY, "textFormat": {"foregroundColor": GOLD, "bold": True}},
+            "backgroundColor,textFormat", r0=0, r1=1),
+        fmt(0, 1, {"numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"}}, "numberFormat"),
+        fmt(1, 3, hide0, "numberFormat"),
+        fmt(4, 5, {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽"'}}, "numberFormat"),
+        fmt(7, 8, {"numberFormat": {"type": "NUMBER", "pattern": MONEY}}, "numberFormat"),
+    ]}).execute()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--import-json", action="store_true")
     parser.add_argument("--layout-only", action="store_true")
-    parser.add_argument("--ensure-ledger", action="store_true")
+    parser.add_argument("--ledger", action="store_true", help="записать «Журнал» формулой (боты в него не пишут)")
     parser.add_argument("--summary-only", action="store_true",
                         help="переписать только «Сводный» и «Отчет бухгалтеру» (данные не трогает)")
     parser.add_argument("--period-from", help="день закрытия для «Сводный» D1, ГГГГ-ММ-ДД")
@@ -611,8 +642,8 @@ def main() -> int:
         write_report(svc, ids)
         print("Готово:", store.sheet_url())
         return 0
-    if args.ensure_ledger:
-        ensure_ledger(svc, ids, backfill=True)
+    if args.ledger:
+        write_ledger(svc, ids)
         print("Готово:", store.sheet_url())
         return 0
     _clear_filters_and_groups(svc, meta)

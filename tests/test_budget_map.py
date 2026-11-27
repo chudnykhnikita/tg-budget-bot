@@ -186,48 +186,6 @@ class BudgetMapTests(unittest.TestCase):
             (m.CAT_DELIVERY, "Байкал сервис"),
         )
 
-    def test_ledger_row_splits_income_and_expense(self):
-        income = m.ledger_row_from_tx({
-            "id": "i1",
-            "type": "income",
-            "account": "cash",
-            "amount": "19000.00",
-            "category": "остаток",
-            "note": None,
-            "date": "2026-10-22 11:58",
-        })
-        self.assertEqual(income[0], "2026-10-22")
-        self.assertEqual(income[1], 19000.0)
-        self.assertEqual(income[2], "")
-        self.assertEqual(income[3], "Наличные")
-        self.assertEqual(income[4], 19000.0)
-        self.assertEqual(income[5], m.SRC_OPENING)
-        expense = m.ledger_row_from_tx({
-            "id": "e1",
-            "type": "expense",
-            "account": "card",
-            "amount": "68.00",
-            "category": m.CAT_BANK,
-            "note": "Комиссия",
-            "bank": "tinkoff",
-            "date": "2026-10-27 10:00",
-        })
-        self.assertEqual(expense[1], "")
-        self.assertEqual(expense[2], 68.0)
-        self.assertEqual(expense[3], "Карта · Тиньков")
-        self.assertEqual(expense[6], "Комиссия")
-        tr = m.ledger_row_from_transfer({
-            "id": "tr",
-            "amount": "150000.00",
-            "from": "cash",
-            "to": "card",
-            "date": "2026-11-20 12:30",
-        })
-        self.assertEqual(tr[1], "")
-        self.assertEqual(tr[2], "")
-        self.assertEqual(tr[3], "Наличные → Карта")
-        self.assertEqual(tr[5], "Перевод")
-
     def test_period_carry_detection(self):
         self.assertTrue(m.is_period_carry({
             "type": "income", "account": "cash", "category": m.SRC_OPENING,
@@ -262,13 +220,3 @@ class BudgetMapTests(unittest.TestCase):
         manual = m.row_to_transaction(m.SHEET_OPS_CASH_OUT, ["27.11.2026", 100, "Обеды", "", "", "", "k", ""])
         self.assertIsNotNone(manual)   # строку дописали руками без статуса — она в текущем периоде
 
-    def test_ledger_titles(self):
-        self.assertEqual(m.ledger_title(1), "Журнал")
-        self.assertEqual(m.ledger_title(2), "Журнал 2")
-        self.assertEqual(m.ledger_index("Журнал"), 1)
-        self.assertEqual(m.ledger_index("Журнал 3"), 3)
-        self.assertIsNone(m.ledger_index("Переводы"))
-
-
-if __name__ == "__main__":
-    unittest.main()
