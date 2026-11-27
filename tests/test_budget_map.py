@@ -282,6 +282,37 @@ class BudgetMapTests(unittest.TestCase):
         self.assertEqual(data["transactions"][0]["status"], m.STATUS_DELETED)
         self.assertFalse(m.merge_payroll(data, [fresh, gone, archived, live_void]))
 
+    def test_merge_payroll_method_switch_keeps_active_row(self):
+        # Склад сменил способ: на «Карта списания» строка «Удалена», на «Наличные списания» тот же ключ «Активна».
+        card = m.payroll_tx_from_expense_row(m.SHEET_OPS_CARD_OUT, [
+            "23.11.2026", "5000", "ЗП упаковщиков", "Ярослав", "Тиньков", "", "zp:sw", "Удалена", "7"])
+        cash = m.payroll_tx_from_expense_row(m.SHEET_OPS_CASH_OUT, [
+            "23.11.2026", "5000", "ЗП упаковщиков", "Ярослав", "", "", "zp:sw", "Активна", "7"])
+        old = dict(card, status=m.STATUS_ACTIVE)
+        for order in ([card, cash], [cash, card]):
+            data = {"transactions": [dict(old)], "periods": []}
+            self.assertTrue(m.merge_payroll(data, order))
+            [tx] = data["transactions"]
+            self.assertEqual((tx["account"], tx["status"], tx["bank"]), ("cash", m.STATUS_ACTIVE, None))
+            self.assertFalse(m.merge_payroll(data, order))
+        data = {"transactions": [], "periods": []}
+        m.merge_payroll(data, [card, cash])
+        self.assertEqual([t["account"] for t in data["transactions"]], ["cash"])
+
+    def test_expense_balance_is_account_remainder(self):
+        import sheets_budget as store
+        f = store._balance_formula(7)
+        self.assertTrue(f.startswith('=IF(OR(B7="";H7<>"Активна");"";'))
+        self.assertIn("SUMIFS('Наличные поступления'!$B:$B", f)
+        self.assertIn('"Карта → Наличные"', f)
+        self.assertIn('-SUMIFS(\'Переводы\'!$B:$B;\'Переводы\'!$C:$C;"Наличные → Карта"', f)
+        self.assertIn('-SUMIFS($B:$B;$A:$A;"<"&A7;$H:$H;"Активна")', f)
+        self.assertIn('-SUMIFS($B$2:B7;$A$2:A7;A7;$H$2:H7;"Активна")', f)
+        g = store._balance_formula(7, m.SHEET_OPS_CARD_OUT)
+        self.assertIn("SUMIFS('Карта поступления'!$B:$B", g)
+        self.assertIn('-SUMIFS(\'Переводы\'!$B:$B;\'Переводы\'!$C:$C;"Карта → Наличные"', g)
+        self.assertNotIn("Наличные поступления", g)
+
     def test_ledger_titles(self):
         self.assertEqual(m.ledger_title(1), "Журнал")
         self.assertEqual(m.ledger_title(2), "Журнал 2")

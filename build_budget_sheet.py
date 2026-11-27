@@ -247,15 +247,13 @@ def format_journals(svc, ids: dict[str, int]) -> None:
         })
         reqs.append(_dropdown(sid, status_idx, [m.STATUS_ACTIVE, m.STATUS_DELETED]))
     reqs.extend(_journal_dropdowns(ids))
-    # Running balance on expense sheets.
+    # Running balance on expense sheets: account remainder after the row (see store._balance_formula).
     for title in (m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT):
         sid = ids[title]
         reqs.append(_money_col(sid, 5))
         formulas = []
         for row in range(2, 1002):
-            formulas.append([
-                f'=IF(B{row}="";"";SUMIFS($B$2:B{row};$H$2:H{row};"Активна"))'
-            ])
+            formulas.append([store._balance_formula(row, title)])
         svc.spreadsheets().values().update(
             spreadsheetId=store.SHEET_ID,
             range=f"'{title}'!F2:F1001",
@@ -535,7 +533,7 @@ def import_json(svc, path: Path) -> None:
         for i, row in enumerate(rows):
             values = list(row)
             if title in (m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT) and len(values) > 5:
-                values[5] = store._balance_formula(i + 2)
+                values[5] = store._balance_formula(i + 2, title)
             cleaned.append(["" if v is None else v for v in values])
         end = chr(64 + len(HEADERS[title]))
         payload.append({

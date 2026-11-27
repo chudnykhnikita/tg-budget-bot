@@ -106,8 +106,24 @@ def _last_row(sheet: str) -> int:
     return 1
 
 
-def _balance_formula(row_number: int) -> str:
-    return f'=IF(B{row_number}="";"";SUMIFS($B$2:B{row_number};$H$2:H{row_number};"Активна"))'
+def _balance_formula(row_number: int, sheet: str = m.SHEET_OPS_CASH_OUT) -> str:
+    """«Плавающий баланс» листа списаний — остаток счёта после этой строки, как в «💰 Баланс»:
+    поступления счёта + переводы на счёт − переводы со счёта − списания, всё «Активна» по дату строки включительно;
+    списания того же дня — по порядку строк. У строк «Удалена» (прошлый период, удалённые) — пусто. До 27.11.2026 здесь была нарастающая сумма списаний."""
+    n = row_number
+    cash = sheet == m.SHEET_OPS_CASH_OUT
+    inc = m.SHEET_OPS_CASH_IN if cash else m.SHEET_OPS_CARD_IN
+    me, other = ("Наличные", "Карта") if cash else ("Карта", "Наличные")
+    tr = m.SHEET_TRANSFERS
+    on_day = f'"<="&A{n}'
+    return (
+        f'=IF(OR(B{n}="";H{n}<>"Активна");"";'
+        f"SUMIFS('{inc}'!$B:$B;'{inc}'!$A:$A;{on_day};'{inc}'!$G:$G;\"Активна\")"
+        f"+SUMIFS('{tr}'!$B:$B;'{tr}'!$C:$C;\"{other} → {me}\";'{tr}'!$A:$A;{on_day};'{tr}'!$G:$G;\"Активна\")"
+        f"-SUMIFS('{tr}'!$B:$B;'{tr}'!$C:$C;\"{me} → {other}\";'{tr}'!$A:$A;{on_day};'{tr}'!$G:$G;\"Активна\")"
+        f'-SUMIFS($B:$B;$A:$A;"<"&A{n};$H:$H;"Активна")'
+        f'-SUMIFS($B$2:B{n};$A$2:A{n};A{n};$H$2:H{n};"Активна"))'
+    )
 
 
 def _ledger_balance_formula(row_number: int) -> str:
@@ -122,7 +138,7 @@ def _append(sheet: str, row: list) -> int:
     start = _last_row(sheet) + 1
     values = list(row)
     if sheet in (m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT) and len(values) > 5:
-        values[5] = _balance_formula(start)
+        values[5] = _balance_formula(start, sheet)
     if m.ledger_index(sheet) is not None and len(values) > 7:
         values[7] = _ledger_balance_formula(start)
     values = ["" if v is None else v for v in values]

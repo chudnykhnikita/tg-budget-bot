@@ -563,11 +563,17 @@ def merge_payroll(data: dict, rows: list[dict]) -> bool:
                 archived.add(rec["id"])
     txs = data.setdefault("transactions", [])
     by_id = {rec.get("id"): rec for rec in txs}
-    changed = False
+    # Один ключ может стоять на обоих листах: склад сменил способ (карта ↔ наличные) — старая строка «Удалена»,
+    # новая «Активна». Побеждает активная (27.11.2026: 23.11 карта→наличные выпадала, баланс +5 000 ₽).
+    latest: dict[str, dict] = {}
     for rec in rows:
         rid = str(rec.get("id") or "")
         if not rid.startswith(PAYROLL_PREFIX) or rid in archived:
             continue
+        if rid not in latest or rec.get("status") != STATUS_DELETED:
+            latest[rid] = rec
+    changed = False
+    for rid, rec in latest.items():
         current = by_id.get(rid)
         if current is None:
             if rec.get("status") == STATUS_DELETED:
@@ -576,7 +582,13 @@ def merge_payroll(data: dict, rows: list[dict]) -> bool:
             by_id[rid] = rec
             changed = True
             continue
-        if rec.get("status") == STATUS_DELETED and current.get("status") != STATUS_DELETED:
-            current["status"] = STATUS_DELETED
+        if rec.get("status") == STATUS_DELETED:
+            if current.get("status") != STATUS_DELETED:
+                current["status"] = STATUS_DELETED
+                changed = True
+            continue
+        fields = ("account", "amount", "bank", "date", "category", "note", "status")
+        if any(current.get(f) != rec.get(f) for f in fields):
+            current.update({f: rec.get(f) for f in fields})
             changed = True
     return changed

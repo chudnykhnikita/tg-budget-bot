@@ -57,6 +57,8 @@ After the accountant accepts Excel, close the period (`📒 Отчёт` → «З
 
 Tab `Журнал` is a perpetual cash book (Дата, Поступление, Списание, Счёт, Сумма, Категория, Подкатегория, Плавающий баланс). Period close does not clear it. Remainder rows are not written there. At ~10 000 rows the bot creates `Журнал 2`. Backfill: `python3 build_budget_sheet.py --ensure-ledger` (does not wipe monthly journals). Soft-delete is status `Удалена`. Period close must batch-mark archived ids (`_apply_status`); per-row deletes hit Sheets quota and leave Сводный negative.
 
+Expense sheets' column F «Плавающий баланс» is the account remainder after the row, not a running sum of expenses (27.11.2026; `sheets_budget._balance_formula`, copy in warehouse `budget_bridge.py`). `merge_payroll`: one `zp:` key can sit on both expense sheets after a card↔cash switch — the «Активна» row wins.
+
 Cash→card transfers store the destination bank in `bank_to` (column E, «Тиньков»). Column D is the sender bank and is empty for cash.
 
 Key rules:
