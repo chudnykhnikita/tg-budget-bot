@@ -22,7 +22,7 @@ Python 3.12, `python-telegram-bot` v21 (async, polling), Google Sheets API, open
 | `budget_cards.py` | HTML карточек: баланс, отчёт бухгалтеру, история, подтверждение |
 | `tg_rich.py` | `sendRichMessage` + HTML fallback |
 | `budget_map.py` | Категории, имена листов, row↔record, `bank_to`, ledger headers |
-| `sheets_budget.py` | Dual-write в Google Sheets, Журнал, пакетный `_apply_status` |
+| `sheets_budget.py` | Запись и чтение Google Sheets, итоги «Сводного» (`summary`), закрытие периода, пакетный `_apply_status` |
 | `budget_period.py` | Закрытие периода: `prepare_close` / `apply_close` |
 | `build_budget_sheet.py` | Сборка листов и формул (`--ensure-ledger`) |
 | `proxy_failover.py` | SOCKS5 failover к Telegram |
@@ -67,7 +67,7 @@ JSON больше не читается (27.11.2026). Бот раз в день 
 
 Перевод наличные→карта: банк получателя в `bank_to` / колонка E «Тиньков». Иначе SUMIFS Тинькова не видит пополнение.
 
-Бэкофил Журнала: `python3 build_budget_sheet.py --ensure-ledger` (месячные журналы не чистит).
+«Журнал» заново: `python3 build_budget_sheet.py --ledger` (пишет формулу в A2, данные листов не трогает).
 
 ## Потоки в боте
 
@@ -116,4 +116,4 @@ python3 build_budget_sheet.py --ensure-ledger
 - На сервере не трогать `my-budget-bot` и чужие контейнеры.
 - Новые модули: файл + `COPY` в Dockerfile + тест в `tests/`.
 - Не мержить sample xlsx из `примеры бюджетов…`, пока не сказали, какой файл актуален.
-- Не чистить лист Журнал при закрытии периода.
+- Не писать строки в лист Журнал: он целиком формула.
