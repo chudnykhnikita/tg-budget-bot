@@ -308,3 +308,17 @@ class BudgetCardsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CashToCardBank(unittest.TestCase):
+    def test_cash_to_card_transfer_counts_in_destination_bank(self):
+        data = {"transactions": [
+            {"id": "a", "user_id": 1, "type": "expense", "account": "card", "bank": "tinkoff", "amount": "45827.00",
+             "category": "Другое", "date": "2026-11-25 10:00"}],
+            "transfers": [{"id": "t", "user_id": 1, "from": "cash", "to": "card", "bank": None, "bank_to": "tinkoff",
+                           "amount": "40827.00", "date": "2026-11-26 14:56"}]}
+        snap = cards.build_snapshot(data, 1)
+        [bank] = snap["banks"]
+        self.assertEqual((bank["label"], bank["bal"]), ("Тиньков", Decimal("-5000.00")))
+        self.assertEqual(snap["card_bal"], bank["bal"])
+

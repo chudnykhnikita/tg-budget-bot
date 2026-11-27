@@ -83,7 +83,9 @@ def _bank_tr_net(trs: list[dict], bank_key: str) -> Decimal:
     for t in trs:
         amount = _amt(t)
         if t.get("to") == "card":
-            dest = t.get("bank_to") if t.get("from") == "card" else t.get("bank")
+            # Банк получателя — bank_to (и для «Наличные → Карта»); bank — отправитель, у наличных пуст.
+            # До 27.11.2026 здесь брался bank: перевод 26.11 на 40 827 ₽ не попадал в «Тиньков».
+            dest = t.get("bank_to") or (t.get("bank") if t.get("from") != "card" else None)
             if dest == bank_key:
                 incoming += amount
         if t.get("from") == "card" and t.get("bank") == bank_key:
