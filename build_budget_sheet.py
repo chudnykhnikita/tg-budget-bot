@@ -180,7 +180,10 @@ def _date_col(sheet_id: int) -> dict:
     }
 
 
-def _money_col(sheet_id: int, col: int) -> dict:
+BALANCE_PATTERN = '#,##0" ₽";[Red]-#,##0" ₽";0" ₽"'   # «Плавающий баланс»: минус красным, не скобки (27.11.2026)
+
+
+def _money_col(sheet_id: int, col: int, pattern: str = '#,##0" ₽";-#,##0" ₽";"-"') -> dict:
     return {
         "repeatCell": {
             "range": {
@@ -189,7 +192,7 @@ def _money_col(sheet_id: int, col: int) -> dict:
                 "startColumnIndex": col,
                 "endColumnIndex": col + 1,
             },
-            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";"-"'}}},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": pattern}}},
             "fields": "userEnteredFormat.numberFormat",
         }
     }
@@ -250,7 +253,7 @@ def format_journals(svc, ids: dict[str, int]) -> None:
     # Running balance on expense sheets: account remainder after the row (see store._balance_formula).
     for title in (m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT):
         sid = ids[title]
-        reqs.append(_money_col(sid, 5))
+        reqs.append(_money_col(sid, 5, BALANCE_PATTERN))
         formulas = []
         for row in range(2, 1002):
             formulas.append([store._balance_formula(row, title)])
