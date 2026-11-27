@@ -3,8 +3,6 @@ import re
 import json
 import logging
 import asyncio
-import tempfile
-import time
 import uuid
 import warnings
 from datetime import datetime, date, timedelta
@@ -28,6 +26,8 @@ from telegram.ext import (
     ConversationHandler,
     CallbackQueryHandler,
     filters,
+    TypeHandler,
+    ApplicationHandlerStop,
     ContextTypes,
 )
 from proxy_failover import ProxyFailoverRequest
@@ -188,185 +188,92 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 _lock = asyncio.Lock()
-_payroll_checked = 0.0
-_PAYROLL_INTERVAL = 15.0
+
+# Доступ: бюджет общий для строк таблицы, поэтому бот отвечает только этим людям (27.11.2026).
+ALLOWED_USER_IDS = {
+    int(x) for x in re.split(r"[,\s]+", os.environ.get("ALLOWED_USER_IDS", "236305027")) if x.strip().isdigit()
+}
 
 # ---------------------------------------------------------------------------
-# Работа с данными
+# Работа с данными: Google-таблица — единственный источник правды (27.11.2026)
 # ---------------------------------------------------------------------------
+# Бот пишет строки листов и читает их обратно; остатки и итоги берёт готовыми из формул «Сводного».
+# JSON не читается: в DATA_FILE/backups раз в день кладётся снимок таблицы на случай сбоя.
 
 def _empty_data() -> dict:
-    return {"transactions": [], "requests": [], "transfers": [], "periods": []}
+    return {"transactions": [], "requests": [], "transfers": []}
 
 
-def _migrate(data: dict) -> dict:
-    """Идемпотентная миграция данных к актуальной схеме."""
-    data.setdefault("transactions", [])
-    data.setdefault("requests", [])
-    data.setdefault("transfers", [])
-    data.setdefault("periods", [])
-
-    # Транзакции до cash/card-разделения: дополняем id/account/note/bank,
-    # подстраховываемся от отсутствующего type, нормализуем amount к "X.XX".
-    for t in data["transactions"]:
-        if "id" not in t:
-            t["id"] = str(uuid.uuid4())
-        if "account" not in t:
-            t["account"] = "card"   # legacy default — большинство операций были по карте
-        if "note" not in t:
-            t["note"] = None
-        if "type" not in t:
-            t["type"] = "expense"   # подстраховка
-        # Все старые карточные операции — Тиньков (ВТБ появился только 2026-05-27)
-        if "bank" not in t:
-            t["bank"] = BANK_TINKOFF if t.get("account") == "card" else None
-        amt = t.get("amount") or 0  # handles None and missing
-        try:
-            t["amount"] = str(Decimal(str(amt)).quantize(Decimal("0.01"), ROUND_HALF_UP))
-        except (InvalidOperation, ValueError):
-            t["amount"] = "0.00"
-
-    # Запросы и переводы — id/amount нормализация на всякий случай
-    for r in data["requests"]:
-        if "id" not in r:
-            r["id"] = str(uuid.uuid4())
-        # Все старые запросы — Тиньков
-        if "bank" not in r:
-            r["bank"] = BANK_TINKOFF
-        try:
-            r["amount"] = str(Decimal(str(r.get("amount") or 0)).quantize(Decimal("0.01"), ROUND_HALF_UP))
-        except (InvalidOperation, ValueError):
-            r["amount"] = "0.00"
-    for t in data["transfers"]:
-        if "id" not in t:
-            t["id"] = str(uuid.uuid4())
-        # Все старые переводы — Тиньков
-        if "bank" not in t:
-            t["bank"] = BANK_TINKOFF
-        try:
-            t["amount"] = str(Decimal(str(t.get("amount") or 0)).quantize(Decimal("0.01"), ROUND_HALF_UP))
-        except (InvalidOperation, ValueError):
-            t["amount"] = "0.00"
-
-    return data
+def _require_sheet() -> None:
+    if sheets_store is None or not sheets_store.configured():
+        raise OSError("Google-таблица не настроена: нужен GOOGLE_CREDENTIALS_FILE")
 
 
 def load_data() -> dict:
-    if not os.path.exists(DATA_FILE):
-        return _empty_data()
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except json.JSONDecodeError:
-        # Бэкап с таймстампом — чтобы не перетирать прошлые повреждения
-        ts = datetime.now(MOSCOW_TZ).strftime("%Y%m%d_%H%M%S")
-        backup = f"{DATA_FILE}.corrupt.{ts}"
-        logger.exception("Corrupted %s, backing up to %s", DATA_FILE, backup)
-        try:
-            os.rename(DATA_FILE, backup)
-        except OSError:
-            logger.exception("Failed to backup corrupt data file")
-        return _empty_data()
-    return _migrate(data)
-
-
-def _load_fresh() -> dict:
-    """JSON плюс выплаты zp:, которые склад записал только в таблицу."""
-    global _payroll_checked
-    data = load_data()
-    now = time.monotonic()
-    if (
-        sheets_store is None
-        or not sheets_store.configured()
-        or now - _payroll_checked < _PAYROLL_INTERVAL
-    ):
-        return data
-    try:
-        rows = sheets_store.external_payroll()
-    except Exception:
-        logger.exception("Не удалось прочитать выплаты zp: из таблицы")
-        return data
-    _payroll_checked = now
-    if m.merge_payroll(data, rows):
-        _save_data_sync(data)
-        logger.info("В журнал дописаны выплаты упаковщиков из таблицы")
-    return data
+    """Строки текущего периода из таблицы (копия: вызывающий может менять её без вреда кэшу)."""
+    import copy
+    _require_sheet()
+    return copy.deepcopy(sheets_store.load_data())
 
 
 async def _locked_load() -> dict:
     async with _lock:
-        return await asyncio.to_thread(_load_fresh)
-
-
-def _save_data_sync(data: dict):
-    """Синхронная атомарная запись через временный файл + os.replace.
-    НЕ берёт лок — для использования из под уже захваченного _lock."""
-    dir_ = os.path.dirname(DATA_FILE) or "."
-    os.makedirs(dir_, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".budget_", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, DATA_FILE)
-    except Exception:
         try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
-    _make_daily_backup(data, dir_)
+            return await asyncio.to_thread(load_data)
+        except Exception as exc:
+            logger.exception("Google Sheet read failed")
+            raise OSError("sheet read failed") from exc
+
+
+async def _summary() -> dict:
+    try:
+        return await asyncio.to_thread(sheets_store.summary)
+    except Exception as exc:
+        logger.exception("Сводный: чтение формул не удалось")
+        raise OSError("summary read failed") from exc
 
 
 def _make_daily_backup(data: dict, dir_: str):
-    """Сохраняет одну копию в день в папку backups/, чистит копии старше 30 дней."""
+    """Один снимок таблицы в день в backups/, копии старше 30 дней удаляются. Только на случай сбоя."""
     try:
         backup_dir = os.path.join(dir_, "backups")
         os.makedirs(backup_dir, exist_ok=True)
         today = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
-        backup_path = os.path.join(backup_dir, f"budget_data_{today}.json")
+        backup_path = os.path.join(backup_dir, f"budget_sheet_{today}.json")
         if not os.path.exists(backup_path):
             tmp = backup_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, backup_path)
-            # Удаляем бэкапы старше 30 дней
             cutoff = datetime.now(MOSCOW_TZ).timestamp() - 30 * 86400
             for fname in os.listdir(backup_dir):
                 fpath = os.path.join(backup_dir, fname)
                 if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
                     os.unlink(fpath)
     except Exception:
-        pass  # бэкап не должен ломать основной поток
+        logger.exception("Дневной снимок таблицы не записан")   # снимок не должен ломать запись
 
 
-async def save_data(data: dict):
-    """Атомарная запись под глобальным локом."""
+def _backup_after_write() -> None:
+    try:
+        _make_daily_backup(sheets_store.load_data(), os.path.dirname(DATA_FILE) or ".")
+    except Exception:
+        logger.exception("Дневной снимок таблицы не записан")
+
+
+async def _atomic_modify(mutator):
+    """Изменение существующих строк: sheets_store.modify применяет mutator к строкам таблицы и пишет разницу."""
     async with _lock:
-        await asyncio.to_thread(_save_data_sync, data)
-
-
-async def _atomic_modify(mutator, *, mirror_sheet: bool = True):
-    """Атомарно: load → mutator(data) → save. Под одним локом —
-    защищает от гонок между конкурентными write-операциями."""
-    async with _lock:
-        data = await asyncio.to_thread(_load_fresh)
-        mutator(data)
-        if (
-            mirror_sheet
-            and sheets_store is not None
-            and sheets_store.configured()
-        ):
-            try:
-                await asyncio.to_thread(sheets_store.modify, mutator)
-            except Exception as exc:
-                logger.exception("Google Sheet update failed")
-                raise OSError("sheet write failed") from exc
-        await asyncio.to_thread(_save_data_sync, data)
+        try:
+            _require_sheet()
+            await asyncio.to_thread(sheets_store.modify, mutator)
+        except Exception as exc:
+            logger.exception("Google Sheet update failed")
+            raise OSError("sheet write failed") from exc
+        await asyncio.to_thread(_backup_after_write)
 
 
 def _sheet_append(kind: str, record: dict) -> None:
-    if sheets_store is None:
-        return
     if kind == "transaction":
         sheets_store.append_transaction(record)
     elif kind == "request":
@@ -377,14 +284,16 @@ def _sheet_append(kind: str, record: dict) -> None:
         raise ValueError(kind)
 
 
-async def _persist(kind: str, record: dict, mutator) -> None:
-    if sheets_store is not None and sheets_store.configured():
+async def _persist(kind: str, record: dict, mutator=None) -> None:
+    """Новая запись — строка в таблицу. Не записалось в таблицу — значит не записано (OSError)."""
+    async with _lock:
         try:
+            _require_sheet()
             await asyncio.to_thread(_sheet_append, kind, record)
         except Exception as exc:
             logger.exception("Google Sheet write failed")
             raise OSError("sheet write failed") from exc
-    await _atomic_modify(mutator, mirror_sheet=False)
+        await asyncio.to_thread(_backup_after_write)
 
 
 async def _save_transaction(user_id: int, amount: Decimal, t_type: str,
@@ -504,6 +413,19 @@ def _reply_kb(options: list[str], add_free: bool = False, add_dates: bool = Fals
 # Error handler
 # ---------------------------------------------------------------------------
 
+async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Чужим — отказ и стоп: бот показывает весь бюджет из таблицы, а не только записи пользователя."""
+    user = update.effective_user
+    if user is not None and user.id in ALLOWED_USER_IDS:
+        return
+    logger.warning("Отказ в доступе: %s", user.id if user else "?")
+    if update.callback_query:
+        await update.callback_query.answer("Нет доступа", show_alert=False)
+    elif update.effective_message:
+        await update.effective_message.reply_text("Нет доступа.")
+    raise ApplicationHandlerStop
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
@@ -523,7 +445,7 @@ async def _send_card(update: Update, html: str, reply_markup=MAIN_KEYBOARD):
 
 async def _snapshot_for(update: Update) -> dict:
     data = await _locked_load()
-    return budget_cards.build_snapshot(data, update.effective_user.id)
+    return budget_cards.build_snapshot(data, None, summary=await _summary())
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1075,9 +997,9 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if _data is None:
         _data = await _locked_load()
     user_id = update.effective_user.id
-    txs     = [t for t in _data["transactions"] if t["user_id"] == user_id]
-    reqs    = [r for r in _data["requests"]     if r["user_id"] == user_id]
-    trs     = [t for t in _data["transfers"]    if t["user_id"] == user_id]
+    txs     = list(_data["transactions"])   # бюджет общий: все строки текущего периода
+    reqs    = list(_data["requests"])
+    trs     = list(_data["transfers"])
 
     target = update.effective_message
     if not txs and not reqs and not trs:
@@ -1240,16 +1162,15 @@ def _edit_item_label(item: dict, is_request: bool, is_transfer: bool = False) ->
 
 def _edit_get_filtered(data: dict, user_id: int, flt: dict) -> list[dict]:
     if flt["type"] == "requests":
-        items = [r for r in data["requests"]  if r["user_id"] == user_id]
+        items = list(data["requests"])
     elif flt["type"] == "transfers":
-        items = [t for t in data["transfers"] if t["user_id"] == user_id]
+        items = list(data["transfers"])
     else:
         account   = flt["type"]      # "cash" | "card"
         direction = flt["direction"] # "income" | "expense"
         items = [
             t for t in data["transactions"]
-            if t["user_id"] == user_id
-            and t.get("account") == account
+            if t.get("account") == account
             and t["type"]       == direction
         ]
     # Свежие сверху
@@ -1542,7 +1463,7 @@ async def edit_list_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data    = await _locked_load()
         coll    = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == item_id), None)
-        if item is None or item["user_id"] != update.effective_user.id:
+        if item is None or not item.get("id"):
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
         context.user_data["edit_tx_id"]       = item_id
@@ -1573,7 +1494,7 @@ async def edit_field_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data   = await _locked_load()
         coll   = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == tx_id), None)
-        if item is None or item["user_id"] != update.effective_user.id:
+        if item is None or not item.get("id"):
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
         await _edit_render_delete_confirm(query, item, is_req, is_tr)
@@ -1610,7 +1531,7 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
         data   = await _locked_load()
         coll   = data[_get_collection_key(is_req, is_tr)]
         item = next((x for x in coll if x["id"] == tx_id), None)
-        if item is None or item["user_id"] != update.effective_user.id:
+        if item is None or not item.get("id"):
             await query.edit_message_text("⛔ Операция недоступна.")
             return ConversationHandler.END
         await _edit_render_item(query, context, item, is_req, is_tr)
@@ -1627,7 +1548,7 @@ async def edit_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         def mutate(data):
             item = next((x for x in data[key] if x.get("id") == tx_id), None)
-            if item is None or item.get("user_id") != user_id:
+            if item is None or not item.get("id"):
                 return
             deleted_amount[0] = item["amount"]
             data[key] = [x for x in data[key] if x.get("id") != tx_id]
@@ -1698,7 +1619,7 @@ async def edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     def mutate(data):
         item = next((x for x in data[key] if x.get("id") == tx_id), None)
-        if item is None or item.get("user_id") != user_id:
+        if item is None or not item.get("id"):
             return
         item[field] = new_value
         found[0] = True
@@ -1738,8 +1659,12 @@ def _close_kb():
 
 
 async def _ask_close_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await _locked_load()
-    plan = budget_period.prepare_close(data, update.effective_user.id)
+    try:
+        data = await _locked_load()
+        plan = budget_period.prepare_close(data, None, summary=await _summary())
+    except OSError:
+        await update.effective_message.reply_text("⚠️ Таблица не ответила, попробуй ещё раз.", reply_markup=MAIN_KEYBOARD)
+        return
     if not plan.ok:
         target = update.effective_message
         await target.reply_text(plan.reason, reply_markup=MAIN_KEYBOARD)
@@ -1762,19 +1687,23 @@ async def close_period_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     user_id = update.effective_user.id
-    plan_box: dict = {}
-
-    def mutate(data):
-        plan = plan_box.setdefault("plan", budget_period.prepare_close(data, user_id))
-        budget_period.apply_close(data, plan)
-
+    plan = None
     try:
-        await _atomic_modify(mutate)
-    except OSError:
+        async with _lock:   # остатки считаем заново из формул прямо перед закрытием
+            _require_sheet()
+            sheets_store._invalidate()   # без кэша: закрываем по свежим формулам
+            data = await asyncio.to_thread(load_data)
+            plan = budget_period.prepare_close(data, None, summary=await _summary())
+            if plan.ok:
+                for rec in plan.openings:
+                    rec["user_id"] = user_id
+                day = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+                await asyncio.to_thread(sheets_store.close_period, plan.openings, day)
+        await asyncio.to_thread(_backup_after_write)
+    except Exception:
         logger.exception("Failed to close period")
         await query.message.reply_text("⚠️ Не удалось закрыть период, попробуй ещё раз.", reply_markup=MAIN_KEYBOARD)
         return
-    plan = plan_box.get("plan")
     if plan is None or not plan.ok:
         await query.message.reply_text(plan.reason if plan else "Закрывать нечего.", reply_markup=MAIN_KEYBOARD)
         return
@@ -1853,6 +1782,7 @@ def main():
         .build()
     )
 
+    app.add_handler(TypeHandler(Update, guard), group=-1)
     app.add_error_handler(on_error)
 
     main_filter = filters.Regex(

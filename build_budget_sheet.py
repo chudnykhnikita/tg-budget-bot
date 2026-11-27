@@ -332,189 +332,160 @@ def _journal_dropdowns(ids: dict[str, int]) -> list[dict]:
     return reqs
 
 
-def write_summary(svc, ids: dict[str, int]) -> None:
-    sid = ids[m.SHEET_SUMMARY]
-    # ru_RU formulas
-    values = [
-        ["Бюджет ИП Чудных Н.Е.", "", "Период с", "=DATE(YEAR(TODAY());MONTH(TODAY());1)"],
-        ["Журналы пишет бот. Остатки и итоги — формулы по активным строкам."],
+ACTIVE = '"Активна"'
+MONEY = '#,##0" ₽";[Red]-#,##0" ₽";0" ₽"'
+
+
+def _sum(sheet: str, status_col: str, *conds: tuple[str, str]) -> str:
+    """SUMIFS по столбцу B листа: только «Активна» (текущий период) + условия (столбец, критерий)."""
+    parts = [f"'{sheet}'!B:B", f"'{sheet}'!{status_col}:{status_col}", ACTIVE]
+    for col, crit in conds:
+        parts += [f"'{sheet}'!{col}:{col}", crit]
+    return "SUMIFS(" + ";".join(parts) + ")"
+
+
+def _q(text: str) -> str:
+    return '"' + text + '"'
+
+
+def summary_values() -> list[list]:
+    """Лист «Сводный»: все цифры бюджета — формулы по строкам «Активна». Бот читает их по подписям в A.
+    Текущий период = строки «Активна»: закрытие переводит их в «Архив», D1 — день закрытия (только подпись)."""
+    ci, co, ki, ko, tr, rq = (m.SHEET_OPS_CASH_IN, m.SHEET_OPS_CASH_OUT, m.SHEET_OPS_CARD_IN,
+                              m.SHEET_OPS_CARD_OUT, m.SHEET_TRANSFERS, m.SHEET_REQUESTS)
+    to_cash, from_cash = _sum(tr, "G", ("C", _q("Карта → Наличные"))), _sum(tr, "G", ("C", _q("Наличные → Карта")))
+
+    def bank(label: str) -> list:
+        b = _q(label)
+        tr_in = _sum(tr, "G", ("C", _q("* → Карта")), ("E", b))
+        tr_out = _sum(tr, "G", ("C", _q("Карта → *")), ("D", b))
+        return [label, f"={_sum(ki, 'G', ('C', b))}", f"={_sum(ko, 'H', ('E', b))}", f"={tr_in}-{tr_out}"]
+
+    rows = [
+        ["Бюджет ИП Чудных Н.Е.", "", "Период с", ""],
+        ["Все цифры — формулы по строкам «Активна» (текущий период). «Закрыть период» в боте переводит их в «Архив»."],
         [],
-        ["Деньги сейчас"],
-        ["Наличные", (
-            f"=SUMIFS('{m.SHEET_OPS_CASH_IN}'!B:B;'{m.SHEET_OPS_CASH_IN}'!G:G;\"Активна\")"
-            f"-SUMIFS('{m.SHEET_OPS_CASH_OUT}'!B:B;'{m.SHEET_OPS_CASH_OUT}'!H:H;\"Активна\")"
-            f"+SUMIFS('{m.SHEET_TRANSFERS}'!B:B;'{m.SHEET_TRANSFERS}'!C:C;\"Карта → Наличные\";'{m.SHEET_TRANSFERS}'!G:G;\"Активна\")"
-            f"-SUMIFS('{m.SHEET_TRANSFERS}'!B:B;'{m.SHEET_TRANSFERS}'!C:C;\"Наличные → Карта\";'{m.SHEET_TRANSFERS}'!G:G;\"Активна\")"
-        )],
-        ["Тиньков", (
-            f"=SUMIFS('{m.SHEET_OPS_CARD_IN}'!B:B;'{m.SHEET_OPS_CARD_IN}'!C:C;\"Тиньков\";'{m.SHEET_OPS_CARD_IN}'!G:G;\"Активна\")"
-            f"-SUMIFS('{m.SHEET_OPS_CARD_OUT}'!B:B;'{m.SHEET_OPS_CARD_OUT}'!E:E;\"Тиньков\";'{m.SHEET_OPS_CARD_OUT}'!H:H;\"Активна\")"
-            f"-SUMIFS('{m.SHEET_TRANSFERS}'!B:B;'{m.SHEET_TRANSFERS}'!C:C;\"Карта → Наличные\";'{m.SHEET_TRANSFERS}'!D:D;\"Тиньков\";'{m.SHEET_TRANSFERS}'!G:G;\"Активна\")"
-            f"+SUMIFS('{m.SHEET_TRANSFERS}'!B:B;'{m.SHEET_TRANSFERS}'!C:C;\"Наличные → Карта\";'{m.SHEET_TRANSFERS}'!E:E;\"Тиньков\";'{m.SHEET_TRANSFERS}'!G:G;\"Активна\")"
-        )],
-        ["ВТБ", (
-            f"=SUMIFS('{m.SHEET_OPS_CARD_IN}'!B:B;'{m.SHEET_OPS_CARD_IN}'!C:C;\"ВТБ\";'{m.SHEET_OPS_CARD_IN}'!G:G;\"Активна\")"
-            f"-SUMIFS('{m.SHEET_OPS_CARD_OUT}'!B:B;'{m.SHEET_OPS_CARD_OUT}'!E:E;\"ВТБ\";'{m.SHEET_OPS_CARD_OUT}'!H:H;\"Активна\")"
-        )],
-        ["Всего", "=B5+B6+B7"],
+        ["Деньги сейчас", "Поступления", "Списания", "Переводы", "Остаток"],
+        ["Наличные", f"={_sum(ci, 'G')}", f"={_sum(co, 'H')}", f"={to_cash}-{from_cash}"],
+        bank("Тиньков"),
+        bank("ВТБ"),
+        ["Карта всего", f"={_sum(ki, 'G')}", f"={_sum(ko, 'H')}", f"={from_cash}-{to_cash}"],
+        ["Всего", "=B5+B8", "=C5+C8", "=D5+D8"],
         [],
-        ["За выбранный месяц"],
-        ["Выручка наличными", (
-            f"=SUMIFS('{m.SHEET_OPS_CASH_IN}'!B:B;'{m.SHEET_OPS_CASH_IN}'!D:D;\"{m.SRC_SALE}\";"
-            f"'{m.SHEET_OPS_CASH_IN}'!A:A;\">=\"&$D$1;'{m.SHEET_OPS_CASH_IN}'!A:A;\"<\"&EDATE($D$1;1);"
-            f"'{m.SHEET_OPS_CASH_IN}'!G:G;\"Активна\")"
-        )],
-        ["Пополнения карты", (
-            f"=SUMIFS('{m.SHEET_OPS_CARD_IN}'!B:B;'{m.SHEET_OPS_CARD_IN}'!A:A;\">=\"&$D$1;"
-            f"'{m.SHEET_OPS_CARD_IN}'!A:A;\"<\"&EDATE($D$1;1);'{m.SHEET_OPS_CARD_IN}'!G:G;\"Активна\")"
-        )],
-        ["Расходы карты", (
-            f"=SUMIFS('{m.SHEET_OPS_CARD_OUT}'!B:B;'{m.SHEET_OPS_CARD_OUT}'!A:A;\">=\"&$D$1;"
-            f"'{m.SHEET_OPS_CARD_OUT}'!A:A;\"<\"&EDATE($D$1;1);'{m.SHEET_OPS_CARD_OUT}'!H:H;\"Активна\")"
-        )],
-        ["Расходы наличных", (
-            f"=SUMIFS('{m.SHEET_OPS_CASH_OUT}'!B:B;'{m.SHEET_OPS_CASH_OUT}'!A:A;\">=\"&$D$1;"
-            f"'{m.SHEET_OPS_CASH_OUT}'!A:A;\"<\"&EDATE($D$1;1);'{m.SHEET_OPS_CASH_OUT}'!H:H;\"Активна\")"
-        )],
-        ["Расходы всего", "=B13+B14"],
+        ["За период (без перенесённых остатков)"],
+        ["Выручка наличными", f"={_sum(ci, 'G', ('D', _q(m.SRC_SALE)))}"],
+        ["Пополнения карты", f"={_sum(ki, 'G')}-{_sum(ki, 'G', ('D', _q(m.SRC_OPENING)))}"],
+        ["Расходы карты", f"={_sum(ko, 'H')}-{_sum(ko, 'H', ('C', _q(m.CAT_PRIOR_DEBT)))}"],
+        ["Расходы наличных", f"={_sum(co, 'H')}-{_sum(co, 'H', ('C', _q(m.CAT_PRIOR_DEBT)))}"],
+        ["Расходы всего", "=B14+B15"],
         [],
         ["Запросы"],
-        ["Запрошено", f"=SUMIFS('{m.SHEET_REQUESTS}'!B:B;'{m.SHEET_REQUESTS}'!F:F;\"Активна\")"],
-        ["Получено на карту", f"=SUMIFS('{m.SHEET_OPS_CARD_IN}'!B:B;'{m.SHEET_OPS_CARD_IN}'!G:G;\"Активна\")"],
-        ["Осталось получить", "=B18-B19"],
+        ["Запрошено", f"={_sum(rq, 'F')}"],
+        ["Получено на карту", "=B13"],
+        ["Осталось получить", "=B19-B20"],
         [],
-        ["Расходы по статьям за месяц"],
+        ["Расходы по статьям за период"],
         ["Статья", "Сумма"],
     ]
-    start = 24
+    for r in range(5, 10):
+        rows[r - 1].append(f"=B{r}-C{r}+D{r}")
+    start = len(rows) + 1
     for i, _cat in enumerate(m.EXPENSE_CATEGORIES):
-        row = start + i
-        col = chr(65 + i)
-        values.append([
-            f"='{m.SHEET_EXPENSE_CATS}'!{col}1",
-            _cat_month_ref(f"A{row}"),
-        ])
+        col = _col(i)
+        cell = f"A{start + i}"
+        rows.append([f"='{m.SHEET_EXPENSE_CATS}'!{col}1",
+                     f"=IF({cell}=\"\";\"\";{_sum(ko, 'H', ('C', cell))}+{_sum(co, 'H', ('C', cell))})"])
+    return rows
+
+
+def _col(i: int) -> str:
+    return store._col_letter(i)
+
+
+SUMMARY_CATS_START = 25   # первая строка статей на «Сводном» (см. summary_values)
+
+
+def write_summary(svc, ids: dict[str, int], period_from: str | None = None) -> None:
+    sid = ids[m.SHEET_SUMMARY]
+    values = summary_values()
+    assert values[SUMMARY_CATS_START - 2] == ["Статья", "Сумма"]
+    if period_from is not None:
+        values[0][3] = period_from
+    else:   # день закрытия хранится в D1 — не затирать
+        cur = svc.spreadsheets().values().get(spreadsheetId=store.SHEET_ID, range=f"'{m.SHEET_SUMMARY}'!D1",
+                                              valueRenderOption="FORMULA").execute().get("values") or [[""]]
+        old = cur[0][0] if cur and cur[0] else ""
+        values[0][3] = "" if str(old).startswith("=") else old
+    svc.spreadsheets().values().clear(spreadsheetId=store.SHEET_ID, range=f"'{m.SHEET_SUMMARY}'!A1:Z200").execute()
     svc.spreadsheets().values().update(
-        spreadsheetId=store.SHEET_ID,
-        range=f"'{m.SHEET_SUMMARY}'!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": values},
+        spreadsheetId=store.SHEET_ID, range=f"'{m.SHEET_SUMMARY}'!A1",
+        valueInputOption="USER_ENTERED", body={"values": values},
     ).execute()
 
+    def fmt(r0, r1, c0, c1, cell, fields):
+        return {"repeatCell": {"range": {"sheetId": sid, "startRowIndex": r0, "endRowIndex": r1,
+                                         "startColumnIndex": c0, "endColumnIndex": c1},
+                               "cell": {"userEnteredFormat": cell}, "fields": f"userEnteredFormat({fields})"}}
+    money = {"numberFormat": {"type": "NUMBER", "pattern": MONEY}}
+    n = len(values)
     reqs = [
-        {
-            "repeatCell": {
-                "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 4},
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": NAVY,
-                        "textFormat": {"bold": True, "foregroundColor": WHITE, "fontFamily": "Arial", "fontSize": 16},
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,textFormat)",
-            }
-        },
-        {
-            "repeatCell": {
-                "range": {"sheetId": sid, "startRowIndex": 7, "endRowIndex": 8, "startColumnIndex": 0, "endColumnIndex": 2},
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": GOLD,
-                        "textFormat": {"bold": True, "fontSize": 14, "fontFamily": "Arial"},
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,textFormat)",
-            }
-        },
-        {
-            "repeatCell": {
-                "range": {"sheetId": sid, "startRowIndex": 4, "endRowIndex": 20, "startColumnIndex": 1, "endColumnIndex": 2},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";"-"'}}},
-                "fields": "userEnteredFormat.numberFormat",
-            }
-        },
-        {
-            "repeatCell": {
-                "range": {"sheetId": sid, "startRowIndex": 23, "endRowIndex": 23 + len(m.EXPENSE_CATEGORIES), "startColumnIndex": 1, "endColumnIndex": 2},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";"-"'}}},
-                "fields": "userEnteredFormat.numberFormat",
-            }
-        },
-        {
-            "repeatCell": {
-                "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 3, "endColumnIndex": 4},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "mmmm yyyy"}}},
-                "fields": "userEnteredFormat.numberFormat",
-            }
-        },
-        {
-            "updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
-                "properties": {"pixelSize": 280},
-                "fields": "pixelSize",
-            }
-        },
-        {
-            "updateSheetProperties": {
-                "properties": {"sheetId": sid, "gridProperties": {"hideGridlines": True}},
-                "fields": "gridProperties.hideGridlines",
-            }
-        },
+        fmt(0, n, 0, 6, {}, "backgroundColor,textFormat,numberFormat"),   # сброс прежнего оформления
+        fmt(0, 1, 0, 5, {"backgroundColor": NAVY, "textFormat": {"bold": True, "foregroundColor": WHITE,
+                                                                   "fontFamily": "Arial", "fontSize": 16}},
+            "backgroundColor,textFormat"),
+        fmt(0, 1, 3, 4, {"numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"}}, "numberFormat"),
+        fmt(3, 4, 0, 5, {"textFormat": {"bold": True}}, "textFormat"),
+        fmt(8, 9, 0, 5, {"backgroundColor": GOLD, "textFormat": {"bold": True, "fontSize": 12}},
+            "backgroundColor,textFormat"),
+        fmt(4, 9, 1, 5, money, "numberFormat"),
+        fmt(11, 21, 1, 2, money, "numberFormat"),
+        fmt(SUMMARY_CATS_START - 1, n, 1, 2, money, "numberFormat"),
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+                                       "properties": {"pixelSize": 280}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 5},
+                                       "properties": {"pixelSize": 120}, "fields": "pixelSize"}},
+        {"updateSheetProperties": {"properties": {"sheetId": sid, "gridProperties": {"hideGridlines": True}},
+                                   "fields": "gridProperties.hideGridlines"}},
     ]
+    for r in (10, 17, SUMMARY_CATS_START - 3):
+        reqs.append(fmt(r, r + 1, 0, 1, {"textFormat": {"bold": True}}, "textFormat"))
     svc.spreadsheets().batchUpdate(spreadsheetId=store.SHEET_ID, body={"requests": reqs}).execute()
 
 
-def _cat_month_ref(label_cell: str) -> str:
-    return (
-        f"=SUMIFS('{m.SHEET_OPS_CARD_OUT}'!B:B;'{m.SHEET_OPS_CARD_OUT}'!C:C;{label_cell};"
-        f"'{m.SHEET_OPS_CARD_OUT}'!A:A;\">=\"&$D$1;'{m.SHEET_OPS_CARD_OUT}'!A:A;\"<\"&EDATE($D$1;1);"
-        f"'{m.SHEET_OPS_CARD_OUT}'!H:H;\"Активна\")"
-        f"+SUMIFS('{m.SHEET_OPS_CASH_OUT}'!B:B;'{m.SHEET_OPS_CASH_OUT}'!C:C;{label_cell};"
-        f"'{m.SHEET_OPS_CASH_OUT}'!A:A;\">=\"&$D$1;'{m.SHEET_OPS_CASH_OUT}'!A:A;\"<\"&EDATE($D$1;1);"
-        f"'{m.SHEET_OPS_CASH_OUT}'!H:H;\"Активна\")"
-    )
-
-
 def write_report(svc, ids: dict[str, int]) -> None:
-    """Месячный отчёт для бухгалтера: те же формулы, период с листа Сводный."""
+    """Отчёт бухгалтеру за текущий период: ссылки на «Сводный»."""
     n = len(m.EXPENSE_CATEGORIES)
-    last = 23 + n
     values = [
-        ["Отчет за месяц", "=Сводный!D1"],
+        ["Отчет за период с", "=Сводный!D1"],
         ["Показатель", "Сумма"],
-        ["Выручка наличными", "=Сводный!B11"],
-        ["Пополнения карты", "=Сводный!B12"],
-        ["Расходы", "=Сводный!B15"],
-        ["Осталось получить по запросам", "=Сводный!B20"],
-        ["Наличные на конец", "=Сводный!B5"],
-        ["Карты на конец", "=Сводный!B6+Сводный!B7"],
-        ["Всего денег", "=Сводный!B8"],
+        ["Выручка наличными", "=Сводный!B12"],
+        ["Пополнения карты", "=Сводный!B13"],
+        ["Расходы", "=Сводный!B16"],
+        ["Осталось получить по запросам", "=Сводный!B21"],
+        ["Наличные на конец", "=Сводный!E5"],
+        ["Карты на конец", "=Сводный!E8"],
+        ["Всего денег", "=Сводный!E9"],
         [],
         ["Расходы по статьям", ""],
         ["Статья", "Сумма"],
     ]
     for i in range(n):
-        src = 24 + i
+        src = SUMMARY_CATS_START + i
         values.append([f"=Сводный!A{src}", f"=Сводный!B{src}"])
+    svc.spreadsheets().values().clear(spreadsheetId=store.SHEET_ID, range=f"'{m.SHEET_REPORT}'!A1:Z200").execute()
     svc.spreadsheets().values().update(
-        spreadsheetId=store.SHEET_ID,
-        range=f"'{m.SHEET_REPORT}'!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": values},
+        spreadsheetId=store.SHEET_ID, range=f"'{m.SHEET_REPORT}'!A1",
+        valueInputOption="USER_ENTERED", body={"values": values},
     ).execute()
     sid = ids[m.SHEET_REPORT]
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=store.SHEET_ID,
-        body={"requests": [
-            {
-                "repeatCell": {
-                    "range": {"sheetId": sid, "startRowIndex": 2, "endRowIndex": 12 + n, "startColumnIndex": 1, "endColumnIndex": 2},
-                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '#,##0" ₽";-#,##0" ₽";"-"'}}},
-                    "fields": "userEnteredFormat.numberFormat",
-                }
-            }
-        ]},
-    ).execute()
+    svc.spreadsheets().batchUpdate(spreadsheetId=store.SHEET_ID, body={"requests": [
+        {"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 1, "endColumnIndex": 2},
+                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"}}},
+                        "fields": "userEnteredFormat.numberFormat"}},
+        {"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 2, "endRowIndex": 12 + n, "startColumnIndex": 1, "endColumnIndex": 2},
+                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": MONEY}}},
+                        "fields": "userEnteredFormat.numberFormat"}},
+    ]}).execute()
 
 
 def import_json(svc, path: Path) -> None:
@@ -609,6 +580,9 @@ def main() -> int:
     parser.add_argument("--import-json", action="store_true")
     parser.add_argument("--layout-only", action="store_true")
     parser.add_argument("--ensure-ledger", action="store_true")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="переписать только «Сводный» и «Отчет бухгалтеру» (данные не трогает)")
+    parser.add_argument("--period-from", help="день закрытия для «Сводный» D1, ГГГГ-ММ-ДД")
     args = parser.parse_args()
     if not store.configured():
         print(
@@ -632,6 +606,11 @@ def main() -> int:
         return 1
     ids = _ids(meta)
     ids = rename_report(svc, ids)
+    if args.summary_only:
+        write_summary(svc, ids, args.period_from)
+        write_report(svc, ids)
+        print("Готово:", store.sheet_url())
+        return 0
     if args.ensure_ledger:
         ensure_ledger(svc, ids, backfill=True)
         print("Готово:", store.sheet_url())
@@ -647,7 +626,7 @@ def main() -> int:
     write_categories(svc)
     ensure_headers(svc)
     format_journals(svc, ids)
-    write_summary(svc, ids)
+    write_summary(svc, ids, args.period_from)
     write_report(svc, ids)
     if args.import_json and not args.layout_only:
         import_json(svc, JSON_PATH)

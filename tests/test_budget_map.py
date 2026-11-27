@@ -239,66 +239,6 @@ class BudgetMapTests(unittest.TestCase):
             "type": "expense", "account": "card", "category": m.CAT_BANK,
         }))
 
-    def test_payroll_row_becomes_card_expense(self):
-        row = [
-            "23.11.2026", "5\xa0000 ₽", "ЗП упаковщиков",
-            "Ярослав Фурсов · 23.11.2026", "Тиньков", "5\xa0000 ₽",
-            "zp:e272ef4ec826335c", "Активна", "236305027",
-        ]
-        rec = m.payroll_tx_from_expense_row(m.SHEET_OPS_CARD_OUT, row)
-        self.assertEqual(rec["id"], "zp:e272ef4ec826335c")
-        self.assertEqual(rec["amount"], "5000.00")
-        self.assertEqual(rec["account"], "card")
-        self.assertEqual(rec["bank"], "tinkoff")
-        self.assertEqual(rec["category"], "ЗП упаковщиков")
-        self.assertEqual(rec["user_id"], 236305027)
-        self.assertEqual(rec["date"], "2026-11-23 12:00")
-        self.assertIsNone(m.payroll_tx_from_expense_row(m.SHEET_OPS_CARD_OUT, ["2026-11-23", 10, "Прочее", "", "Тиньков", "", "uuid", "Активна", 1]))
-
-    def test_merge_payroll_adds_missing_and_voids(self):
-        fresh = m.payroll_tx_from_expense_row(m.SHEET_OPS_CARD_OUT, [
-            "23.11.2026", "5000", "ЗП упаковщиков", "Ярослав", "Тиньков", "",
-            "zp:new", "Активна", "7",
-        ])
-        gone = dict(fresh)
-        gone["id"] = "zp:gone"
-        gone["status"] = m.STATUS_DELETED
-        archived = dict(fresh)
-        archived["id"] = "zp:old"
-        data = {
-            "transactions": [{
-                "id": "zp:live",
-                "status": m.STATUS_ACTIVE,
-                "amount": "100.00",
-            }],
-            "periods": [{"transactions": [{"id": "zp:old"}]}],
-        }
-        live_void = dict(fresh)
-        live_void["id"] = "zp:live"
-        live_void["status"] = m.STATUS_DELETED
-        self.assertTrue(m.merge_payroll(data, [fresh, gone, archived, live_void]))
-        ids = [t["id"] for t in data["transactions"]]
-        self.assertEqual(ids, ["zp:live", "zp:new"])
-        self.assertEqual(data["transactions"][0]["status"], m.STATUS_DELETED)
-        self.assertFalse(m.merge_payroll(data, [fresh, gone, archived, live_void]))
-
-    def test_merge_payroll_method_switch_keeps_active_row(self):
-        # Склад сменил способ: на «Карта списания» строка «Удалена», на «Наличные списания» тот же ключ «Активна».
-        card = m.payroll_tx_from_expense_row(m.SHEET_OPS_CARD_OUT, [
-            "23.11.2026", "5000", "ЗП упаковщиков", "Ярослав", "Тиньков", "", "zp:sw", "Удалена", "7"])
-        cash = m.payroll_tx_from_expense_row(m.SHEET_OPS_CASH_OUT, [
-            "23.11.2026", "5000", "ЗП упаковщиков", "Ярослав", "", "", "zp:sw", "Активна", "7"])
-        old = dict(card, status=m.STATUS_ACTIVE)
-        for order in ([card, cash], [cash, card]):
-            data = {"transactions": [dict(old)], "periods": []}
-            self.assertTrue(m.merge_payroll(data, order))
-            [tx] = data["transactions"]
-            self.assertEqual((tx["account"], tx["status"], tx["bank"]), ("cash", m.STATUS_ACTIVE, None))
-            self.assertFalse(m.merge_payroll(data, order))
-        data = {"transactions": [], "periods": []}
-        m.merge_payroll(data, [card, cash])
-        self.assertEqual([t["account"] for t in data["transactions"]], ["cash"])
-
     def test_expense_balance_is_account_remainder(self):
         import sheets_budget as store
         f = store._balance_formula(7)
@@ -312,6 +252,15 @@ class BudgetMapTests(unittest.TestCase):
         self.assertIn("SUMIFS('Карта поступления'!$B:$B", g)
         self.assertIn('-SUMIFS(\'Переводы\'!$B:$B;\'Переводы\'!$C:$C;"Карта → Наличные"', g)
         self.assertNotIn("Наличные поступления", g)
+
+    def test_open_journal_reads_payroll_rows_and_skips_archive(self):
+        row = ["23.11.2026", 5000, "ЗП упаковщиков", "Ярослав", "Тиньков", "", "zp:e2", "Активна", 236305027]
+        rec = m.row_to_transaction(m.SHEET_OPS_CARD_OUT, row)
+        self.assertEqual((rec["id"], rec["account"], rec["bank"], rec["amount"]), ("zp:e2", "card", "tinkoff", "5000.00"))
+        for status in (m.STATUS_ARCHIVE, m.STATUS_DELETED):
+            self.assertIsNone(m.row_to_transaction(m.SHEET_OPS_CARD_OUT, row[:7] + [status, 1]))
+        manual = m.row_to_transaction(m.SHEET_OPS_CASH_OUT, ["27.11.2026", 100, "Обеды", "", "", "", "k", ""])
+        self.assertIsNotNone(manual)   # строку дописали руками без статуса — она в текущем периоде
 
     def test_ledger_titles(self):
         self.assertEqual(m.ledger_title(1), "Журнал")

@@ -1,7 +1,9 @@
-"""Google Sheets — источник правды бюджета.
+"""Google Sheets — единственный источник правды бюджета (27.11.2026).
 
-Таблица: «Бюджет ИП Чудных Н.Е.». Бот пишет журналы, формулы на «Сводный»
-считают остатки. JSON остаётся дневной копией на случай сбоя API.
+Таблица: «Бюджет ИП Чудных Н.Е.». Бот пишет строки листов, все остатки и итоги
+считают формулы «Сводного»; бот их только читает (`summary`). Текущий период —
+строки «Активна», закрытые периоды — «Архив», удалённые ошибки — «Удалена».
+JSON больше не читается: бот пишет лишь дневную копию снимка на случай сбоя.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from typing import Any, Callable
 
 from google.oauth2 import service_account
@@ -33,6 +36,8 @@ CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE", "")
 _lock = threading.RLock()
 _svc = None
 _cache: dict | None = None
+_cache_at = 0.0
+CACHE_TTL = 20.0   # с, складской бот пишет ЗП прямо в таблицу — свежесть без лишних чтений
 
 # 0-based index of Ключ / Статус after the human-facing columns.
 KEY_STATUS = {
@@ -76,8 +81,9 @@ def _service():
 
 
 def _invalidate():
-    global _cache
+    global _cache, _summary
     _cache = None
+    _summary = None
 
 
 def _col_letter(index: int) -> str:
@@ -186,6 +192,7 @@ def _set_status(sheet: str, key: str, status: str) -> bool:
 def _apply_status(keys: set[str], status: str, sheets: list[str] | None = None) -> int:
     """Mark matching Ключ rows in one batchGet + batchUpdate. Same id may sit
     on a monthly tab and on Журнал — both are updated."""
+    keys = {k for k in keys if k}   # строки без ключа (дописаны руками) статусом по ключу не трогаем
     if not keys:
         return 0
     titles = sheets if sheets is not None else list(KEY_STATUS.keys()) + _ledger_titles()
@@ -431,32 +438,11 @@ def _rows(block: dict | None) -> list[list]:
     return values[1:]
 
 
-def external_payroll() -> list[dict]:
-    """Выплаты zp: с листов списаний. Пустой список, если таблицы нет."""
-    if not configured():
-        return []
-    ranges = [
-        f"'{m.SHEET_OPS_CARD_OUT}'!A:I",
-        f"'{m.SHEET_OPS_CASH_OUT}'!A:I",
-    ]
-    result = _service().spreadsheets().values().batchGet(
-        spreadsheetId=SHEET_ID,
-        ranges=ranges,
-        valueRenderOption="FORMATTED_VALUE",
-    ).execute()
-    found = []
-    for sheet, block in zip((m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT), result.get("valueRanges", [])):
-        for row in _rows(block):
-            item = m.payroll_tx_from_expense_row(sheet, row)
-            if item:
-                found.append(item)
-    return found
-
-
 def load_data() -> dict:
-    global _cache
+    """Строки текущего периода («Активна») всех листов. `seq` — номер строки: порядок внутри одного дня."""
+    global _cache, _cache_at
     with _lock:
-        if _cache is not None:
+        if _cache is not None and time.monotonic() - _cache_at < CACHE_TTL:
             return _cache
         result = _service().spreadsheets().values().batchGet(
             spreadsheetId=SHEET_ID,
@@ -474,9 +460,10 @@ def load_data() -> dict:
             m.SHEET_OPS_CARD_OUT,
             m.SHEET_OPS_CASH_OUT,
         ):
-            for row in _rows(by_range.get(sheet)):
+            for i, row in enumerate(_rows(by_range.get(sheet)), start=2):
                 item = m.row_to_transaction(sheet, row)
                 if item:
+                    item["seq"] = i
                     txs.append(item)
         reqs = []
         for row in _rows(by_range.get(m.SHEET_REQUESTS)):
@@ -484,11 +471,13 @@ def load_data() -> dict:
             if item:
                 reqs.append(item)
         trs = []
-        for row in _rows(by_range.get(m.SHEET_TRANSFERS)):
+        for i, row in enumerate(_rows(by_range.get(m.SHEET_TRANSFERS)), start=2):
             item = m.row_to_transfer(row)
             if item:
+                item["seq"] = i
                 trs.append(item)
         _cache = {"transactions": txs, "requests": reqs, "transfers": trs}
+        _cache_at = time.monotonic()
         return _cache
 
 
@@ -535,3 +524,104 @@ def modify(mutator: Callable[[dict], Any]) -> dict:
 
         _invalidate()
         return load_data()
+
+
+# ---------------------------------------------------------------------------
+# «Сводный»: итоги считают формулы, бот только читает их по подписям в столбце A
+# ---------------------------------------------------------------------------
+
+_summary: dict | None = None
+_summary_at = 0.0
+SUMMARY_RANGE = f"'{m.SHEET_SUMMARY}'!A1:E60"
+# Подпись в A → поле; в строках счетов B:E = поступления, списания, переводы, остаток.
+SUMMARY_ACCOUNTS = {"Наличные": "cash", "Тиньков": "tinkoff", "ВТБ": "vtb", "Карта всего": "card", "Всего": "total"}
+SUMMARY_FIELDS = {
+    "Выручка наличными": "cash_sales",
+    "Пополнения карты": "card_in",
+    "Расходы карты": "card_exp_period",
+    "Расходы наличных": "cash_exp_period",
+    "Расходы всего": "exp_period",
+    "Запрошено": "req_total",
+    "Получено на карту": "req_got",
+    "Осталось получить": "req_remaining",
+}
+
+
+def _num(value):
+    from decimal import Decimal, InvalidOperation
+    try:
+        return Decimal(str(value if value not in (None, "") else 0))
+    except InvalidOperation:
+        return Decimal("0")
+
+
+def parse_summary(rows: list[list]) -> dict:
+    """Ячейки «Сводного» (UNFORMATTED) → числа. Чистая функция: тестируется без таблицы."""
+    out: dict = {"accounts": {}, "period_from": ""}
+    for row in rows:
+        cells = list(row) + [""] * 5
+        label = str(cells[0]).strip()
+        if str(cells[2]).strip() == "Период с":
+            out["period_from"] = cells[3]
+        if label in SUMMARY_ACCOUNTS and len([c for c in cells[1:5] if c != ""]) == 4:
+            inc, exp, tr, bal = (_num(c) for c in cells[1:5])
+            out["accounts"][SUMMARY_ACCOUNTS[label]] = {"inc": inc, "exp": exp, "tr_net": tr, "bal": bal}
+        elif label in SUMMARY_FIELDS:
+            out[SUMMARY_FIELDS[label]] = _num(cells[1])
+    return out
+
+
+def summary() -> dict:
+    """Итоги текущего периода с листа «Сводный» (формулы)."""
+    global _summary, _summary_at
+    with _lock:
+        if _summary is not None and time.monotonic() - _summary_at < CACHE_TTL:
+            return _summary
+        res = _service().spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=SUMMARY_RANGE,
+            valueRenderOption="UNFORMATTED_VALUE", dateTimeRenderOption="FORMATTED_STRING",
+        ).execute()
+        _summary = parse_summary(res.get("values") or [])
+        _summary_at = time.monotonic()
+        if "cash" not in _summary["accounts"]:
+            raise RuntimeError("На листе «Сводный» нет строки «Наличные» с формулами")
+        return _summary
+
+
+def close_period(openings: list[dict], close_day: str) -> int:
+    """Закрытие одним batchUpdate: все «Активна» на листах операций, запросов и переводов → «Архив»,
+    строки остатка (`openings`) — в конец листов, «Сводный» D1 = день закрытия. «Журнал» не трогаем.
+    Возвращает число архивированных строк."""
+    sheets = [m.SHEET_OPS_CARD_IN, m.SHEET_OPS_CASH_IN, m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT,
+              m.SHEET_REQUESTS, m.SHEET_TRANSFERS]
+    with _lock:
+        ranges = [f"'{t}'!A:{_col_letter(KEY_STATUS[t][1])}" for t in sheets]
+        blocks = _service().spreadsheets().values().batchGet(
+            spreadsheetId=SHEET_ID, ranges=ranges, valueRenderOption="UNFORMATTED_VALUE",
+        ).execute().get("valueRanges", [])
+        payload, last = [], {}
+        archived = 0
+        for title, block in zip(sheets, blocks):
+            status_idx = KEY_STATUS[title][1]
+            letter = _col_letter(status_idx)
+            rows = block.get("values") or []
+            last[title] = max((i for i, r in enumerate(rows, start=1) if r and str(r[0]).strip() != ""), default=1)
+            for i, row in enumerate(rows[1:], start=2):
+                cells = list(row) + [""] * (status_idx + 1)
+                if str(cells[0]).strip() and m.is_open(cells[status_idx]):
+                    payload.append({"range": f"'{title}'!{letter}{i}", "values": [[m.STATUS_ARCHIVE]]})
+                    archived += 1
+        for rec in openings:
+            title, row = m.transaction_to_row(rec)
+            n = last[title] = last[title] + 1
+            if title in (m.SHEET_OPS_CARD_OUT, m.SHEET_OPS_CASH_OUT):
+                row[5] = _balance_formula(n, title)
+            values = ["" if v is None else v for v in row]
+            payload.append({"range": f"'{title}'!A{n}:{_col_letter(len(values) - 1)}{n}", "values": [values]})
+        payload.append({"range": f"'{m.SHEET_SUMMARY}'!D1", "values": [[close_day]]})
+        _service().spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEET_ID, body={"valueInputOption": "USER_ENTERED", "data": payload},
+        ).execute()
+        _invalidate()
+        return archived
+

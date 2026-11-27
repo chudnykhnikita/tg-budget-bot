@@ -42,8 +42,14 @@ def _amt(rec: dict) -> Decimal:
     return Decimal(str(rec.get("amount") or 0))
 
 
-def _for_user(rows: list[dict], user_id: int) -> list[dict]:
-    return [r for r in rows if r.get("user_id") == user_id and _alive(r)]
+def _for_user(rows: list[dict], user_id: int | None) -> list[dict]:
+    """user_id=None — весь бюджет (бот с 27.11.2026: доступ только владельцу, строки таблицы общие)."""
+    return [r for r in rows if (user_id is None or r.get("user_id") == user_id) and _alive(r)]
+
+
+def _when(rec: dict) -> tuple[str, int, str]:
+    """Ключ сортировки: настоящая дата (в таблице «27.11.2026»), затем строка листа, затем время из JSON."""
+    return (m.date_only(rec.get("date")), int(rec.get("seq") or 0), str(rec.get("date") or ""))
 
 
 def _short_date(stamp: str | None) -> str:
@@ -93,7 +99,8 @@ def _bank_tr_net(trs: list[dict], bank_key: str) -> Decimal:
     return incoming - outgoing
 
 
-def build_snapshot(data: dict, user_id: int, *, now: datetime | None = None) -> dict:
+def build_snapshot(data: dict, user_id: int | None, *, now: datetime | None = None, summary: dict | None = None) -> dict:
+    """Списки — из строк; суммы — из `summary` (формулы листа «Сводный»), если он передан."""
     now = now or datetime.now(MOSCOW_TZ)
     txs = _for_user(data.get("transactions") or [], user_id)
     reqs = _for_user(data.get("requests") or [], user_id)
@@ -185,20 +192,39 @@ def build_snapshot(data: dict, user_id: int, *, now: datetime | None = None) -> 
         ((source, account, amount) for (source, account), amount in income_sum.items()),
         key=lambda item: (income_order.get(item[0], 99), 0 if item[1] == "card" else 1, -item[2]),
     )
-    income_lines.sort(key=lambda rec: rec.get("date") or "")
-    expense_lines.sort(key=lambda rec: rec.get("date") or "")
+    income_lines.sort(key=_when)
+    expense_lines.sort(key=_when)
 
     req_total = sum((_amt(r) for r in reqs), Decimal("0"))
     events = []
     for t in txs:
-        events.append(("tx", t.get("date") or "", t))
+        events.append(("tx", _when(t), t))
     for t in trs:
-        events.append(("tr", t.get("date") or "", t))
+        events.append(("tr", _when(t), t))
     for r in reqs:
-        events.append(("req", r.get("date") or "", r))
+        events.append(("req", _when(r), r))
     events.sort(key=lambda item: item[1], reverse=True)
 
     stamps = [t.get("date") or "" for t in txs] + [r.get("date") or "" for r in reqs] + [t.get("date") or "" for t in trs]
+    req_got = card_in
+    trs_sorted = sorted(trs, key=_when)
+    if summary is not None:
+        acc = summary["accounts"]
+        zero = {"inc": Decimal("0"), "exp": Decimal("0"), "tr_net": Decimal("0"), "bal": Decimal("0")}
+        cash, card = acc.get("cash", zero), acc.get("card", zero)
+        cash_inc, cash_exp, cash_tr_net, cash_bal = cash["inc"], cash["exp"], cash["tr_net"], cash["bal"]
+        card_inc, card_exp, card_tr_net, card_bal = card["inc"], card["exp"], card["tr_net"], card["bal"]
+        banks = [
+            {"key": key, "label": label, **acc[short]}
+            for (key, label), short in zip(BANK_ORDER, ("tinkoff", "vtb"))
+            if short in acc and any(acc[short][f] != 0 for f in ("inc", "exp", "tr_net", "bal"))
+        ]
+        exp_total = cash_exp + card_exp
+        cash_sales = summary.get("cash_sales", cash_sales)
+        card_in = summary.get("card_in", card_in)
+        req_total = summary.get("req_total", req_total)
+        req_got = summary.get("req_got", card_in)
+    total = summary["accounts"]["total"]["bal"] if summary is not None and "total" in summary["accounts"] else cash_bal + card_bal
     return {
         "now": now,
         "month_label": f"{_RU_MONTHS[now.month - 1]} {now.year}",
@@ -213,12 +239,12 @@ def build_snapshot(data: dict, user_id: int, *, now: datetime | None = None) -> 
         "card_tr_net": card_tr_net,
         "card_bal": card_bal,
         "banks": banks,
-        "total": cash_bal + card_bal,
+        "total": total,
         "req_total": req_total,
-        "req_got": card_inc,
-        "req_remaining": req_total - card_inc,
-        "has_requests": bool(reqs),
-        "transfers": trs,
+        "req_got": req_got,
+        "req_remaining": (summary or {}).get("req_remaining", req_total - req_got),
+        "has_requests": bool(reqs) or req_total != 0,
+        "transfers": trs_sorted,
         "cash_sales": cash_sales,
         "cash_sales_month": cash_sales,
         "card_in": card_in,

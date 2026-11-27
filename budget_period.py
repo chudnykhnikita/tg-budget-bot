@@ -59,12 +59,15 @@ class ClosePlan:
     req_remaining: Decimal = Decimal("0")
 
 
-def prepare_close(data: dict, user_id: int, *, now: datetime | None = None) -> ClosePlan:
+def prepare_close(data: dict, user_id: int | None, *, now: datetime | None = None,
+                  summary: dict | None = None) -> ClosePlan:
+    """Остатки для переноса — из `summary` (формулы «Сводного»), если он передан. user_id=None — весь бюджет."""
     now = now or datetime.now(MOSCOW_TZ)
-    snap = budget_cards.build_snapshot(data, user_id, now=now)
-    txs = [t for t in (data.get("transactions") or []) if t.get("user_id") == user_id]
-    reqs = [r for r in (data.get("requests") or []) if r.get("user_id") == user_id]
-    trs = [t for t in (data.get("transfers") or []) if t.get("user_id") == user_id]
+    snap = budget_cards.build_snapshot(data, user_id, now=now, summary=summary)
+    mine = lambda rec: user_id is None or rec.get("user_id") == user_id
+    txs = [t for t in (data.get("transactions") or []) if mine(t)]
+    reqs = [r for r in (data.get("requests") or []) if mine(r)]
+    trs = [t for t in (data.get("transfers") or []) if mine(t)]
     live_txs = [t for t in txs if _alive(t)]
     live_reqs = [r for r in reqs if _alive(r)]
     live_trs = [t for t in trs if _alive(t)]
@@ -141,7 +144,7 @@ def preview_html(plan: ClosePlan) -> str:
     ]
     body = [
         "<h3>🔒 Закрыть период</h3>",
-        "<p>После того как бухгалтер свела Excel. Старые поступления и списания уйдут в архив и не попадут в следующий отчёт.</p>",
+        "<p>После того как бухгалтер свела Excel. Строки периода получат статус «Архив» в таблице и не попадут в следующий отчёт, остаток перейдёт строкой «Стартовый остаток».</p>",
         table(["", ""], rows, align=["l", "r"]),
     ]
     if plan.req_remaining != 0:

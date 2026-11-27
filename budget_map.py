@@ -6,6 +6,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 STATUS_ACTIVE = "Активна"
 STATUS_DELETED = "Удалена"
+STATUS_ARCHIVE = "Архив"   # строка закрытого периода (27.11.2026); «Удалена» — только удалённые ошибки
 
 SHEET_OPS_CARD_IN = "Карта поступления"
 SHEET_OPS_CARD_OUT = "Карта списания"
@@ -427,11 +428,16 @@ def transfer_to_row(record: dict) -> list:
     ]
 
 
+def is_open(status) -> bool:
+    """Строка текущего периода: «Активна» (или пусто — строку дописали руками). «Архив» и «Удалена» — нет."""
+    return str(status or "").strip() in ("", STATUS_ACTIVE)
+
+
 def row_to_transaction(sheet: str, row: list) -> dict | None:
     padded = list(row) + [""] * 8
     if sheet in (SHEET_OPS_CARD_IN, SHEET_OPS_CASH_IN):
         date, amount, bank, source, note, key, status, user_id = padded[:8]
-        if status == STATUS_DELETED or not amount:
+        if not is_open(status) or not amount:
             return None
         account = "card" if sheet == SHEET_OPS_CARD_IN else "cash"
         category = source if source != SRC_OPENING else "остаток"
@@ -450,7 +456,7 @@ def row_to_transaction(sheet: str, row: list) -> dict | None:
             "status": status or STATUS_ACTIVE,
         }
     date, amount, category, note, bank, _balance, key, status, user_id = padded[:9]
-    if status == STATUS_DELETED or not amount:
+    if not is_open(status) or not amount:
         return None
     account = "card" if sheet == SHEET_OPS_CARD_OUT else "cash"
     return {
@@ -470,7 +476,7 @@ def row_to_transaction(sheet: str, row: list) -> dict | None:
 def row_to_request(row: list) -> dict | None:
     padded = list(row) + [""] * 6
     date, amount, kind, bank, key, status, user_id = padded[:7]
-    if status == STATUS_DELETED or not amount:
+    if not is_open(status) or not amount:
         return None
     return {
         "id": str(key),
@@ -486,7 +492,7 @@ def row_to_request(row: list) -> dict | None:
 def row_to_transfer(row: list) -> dict | None:
     padded = list(row) + [""] * 7
     date, amount, direction, bank, bank_to, key, status, user_id = padded[:8]
-    if status == STATUS_DELETED or not amount:
+    if not is_open(status) or not amount:
         return None
     src, dst = parse_direction(str(direction))
     return {
@@ -509,86 +515,5 @@ def _user_id(value) -> int:
         return 0
 
 
-PAYROLL_PREFIX = "zp:"
+PAYROLL_PREFIX = "zp:"   # ключ строк ЗП, которые пишет складской бот прямо в таблицу
 
-
-def _clean_money(value) -> str:
-    text = str(value or "")
-    for mark in ("₽", "руб.", "руб"):
-        text = text.replace(mark, "")
-    return text.strip()
-
-
-def payroll_tx_from_expense_row(sheet: str, row: list) -> dict | None:
-    """Строка списания с ключом zp: — операция журнала, в том числе со статусом «Удалена».
-
-    Склад пишет выплату упаковщику сразу в таблицу. Бюджетный бот хранит
-    историю в JSON и сам эту строку не создаёт.
-    """
-    padded = list(row) + [""] * 9
-    date, amount, category, note, bank, _balance, key, status, user_id = padded[:9]
-    key = str(key or "").strip()
-    if not key.startswith(PAYROLL_PREFIX):
-        return None
-    money = _clean_money(amount)
-    if not money:
-        return None
-    account = "card" if sheet == SHEET_OPS_CARD_OUT else "cash"
-    day = date_only(str(date or ""))
-    stamp = f"{day} 12:00" if len(day) == 10 and day[4] == "-" else str(date or "")
-    try:
-        money_text = str(parse_amount(money))
-    except Exception:
-        return None
-    return {
-        "id": key,
-        "user_id": _user_id(user_id),
-        "type": "expense",
-        "account": account,
-        "amount": money_text,
-        "category": category or None,
-        "note": note or None,
-        "bank": bank_key(str(bank)) if account == "card" else None,
-        "date": stamp,
-        "status": status or STATUS_ACTIVE,
-    }
-
-
-def merge_payroll(data: dict, rows: list[dict]) -> bool:
-    """Дописывает новые zp:-операции и снимает отменённые. В таблицу не пишет."""
-    archived = set()
-    for period in data.get("periods") or []:
-        for rec in period.get("transactions") or []:
-            if rec.get("id"):
-                archived.add(rec["id"])
-    txs = data.setdefault("transactions", [])
-    by_id = {rec.get("id"): rec for rec in txs}
-    # Один ключ может стоять на обоих листах: склад сменил способ (карта ↔ наличные) — старая строка «Удалена»,
-    # новая «Активна». Побеждает активная (27.11.2026: 23.11 карта→наличные выпадала, баланс +5 000 ₽).
-    latest: dict[str, dict] = {}
-    for rec in rows:
-        rid = str(rec.get("id") or "")
-        if not rid.startswith(PAYROLL_PREFIX) or rid in archived:
-            continue
-        if rid not in latest or rec.get("status") != STATUS_DELETED:
-            latest[rid] = rec
-    changed = False
-    for rid, rec in latest.items():
-        current = by_id.get(rid)
-        if current is None:
-            if rec.get("status") == STATUS_DELETED:
-                continue
-            txs.append(rec)
-            by_id[rid] = rec
-            changed = True
-            continue
-        if rec.get("status") == STATUS_DELETED:
-            if current.get("status") != STATUS_DELETED:
-                current["status"] = STATUS_DELETED
-                changed = True
-            continue
-        fields = ("account", "amount", "bank", "date", "category", "note", "status")
-        if any(current.get(f) != rec.get(f) for f in fields):
-            current.update({f: rec.get(f) for f in fields})
-            changed = True
-    return changed

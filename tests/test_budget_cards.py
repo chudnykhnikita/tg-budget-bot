@@ -322,3 +322,61 @@ class CashToCardBank(unittest.TestCase):
         self.assertEqual((bank["label"], bank["bal"]), ("Тиньков", Decimal("-5000.00")))
         self.assertEqual(snap["card_bal"], bank["bal"])
 
+
+
+class SummaryFromSheet(unittest.TestCase):
+    """«Сводный» считает формулы; бот только читает их (27.11.2026)."""
+
+    ROWS = [
+        ["Бюджет ИП Чудных Н.Е.", "", "Период с", "20.11.2026"],
+        [],
+        [],
+        ["Деньги сейчас", "Поступления", "Списания", "Переводы", "Остаток"],
+        ["Наличные", 476500, 269000, -40827, 166673],
+        ["Тиньков", 94, 45921, 40827, -5000],
+        ["ВТБ", 0, 0, 0, 0],
+        ["Карта всего", 94, 45921, 40827, -5000],
+        ["Всего", 476594, 314921, 0, 161673],
+        [],
+        ["За период (без перенесённых остатков)"],
+        ["Выручка наличными", 0],
+        ["Пополнения карты", 0],
+        ["Расходы всего", 314921],
+        ["Запрошено", 1000],
+        ["Получено на карту", 0],
+        ["Осталось получить", 1000],
+        ["Статья", "Сумма"],
+        ["ЗП упаковщиков", 70000],
+    ]
+
+    def test_parse_summary_by_labels(self):
+        import sheets_budget as store
+        s = store.parse_summary(self.ROWS)
+        self.assertEqual(s["period_from"], "20.11.2026")
+        self.assertEqual(s["accounts"]["cash"]["bal"], Decimal("166673"))
+        self.assertEqual(s["accounts"]["tinkoff"]["tr_net"], Decimal("40827"))
+        self.assertEqual(s["accounts"]["total"]["bal"], Decimal("161673"))
+        self.assertEqual((s["req_total"], s["req_remaining"]), (Decimal("1000"), Decimal("1000")))
+        self.assertNotIn("Деньги сейчас", s["accounts"])
+
+    def test_snapshot_uses_sheet_numbers_not_python_sums(self):
+        import sheets_budget as store
+        data = {"transactions": [{"id": "x", "user_id": 0, "type": "expense", "account": "cash",
+                                  "amount": "1.00", "category": "Обеды", "date": "27.11.2026", "seq": 5}],
+                "requests": [], "transfers": []}
+        snap = cards.build_snapshot(data, None, summary=store.parse_summary(self.ROWS))
+        self.assertEqual((snap["cash_bal"], snap["card_bal"], snap["total"]),
+                         (Decimal("166673"), Decimal("-5000"), Decimal("161673")))
+        self.assertEqual([b["label"] for b in snap["banks"]], ["Тиньков"])   # ВТБ по нулям — не показываем
+        self.assertTrue(snap["has_requests"])
+        self.assertIn("166 673", cards.balance_html(snap))
+        self.assertEqual(len(snap["expense_lines"]), 1)   # строка без «Кто» (дописана руками) видна
+
+    def test_events_sorted_by_real_date_then_row(self):
+        rows = [
+            {"id": "a", "type": "expense", "account": "cash", "amount": "1", "date": "05.12.2026", "seq": 2},
+            {"id": "b", "type": "expense", "account": "cash", "amount": "1", "date": "27.11.2026", "seq": 3},
+            {"id": "c", "type": "expense", "account": "cash", "amount": "1", "date": "27.11.2026", "seq": 4},
+        ]
+        snap = cards.build_snapshot({"transactions": rows, "requests": [], "transfers": []}, None)
+        self.assertEqual([e[2]["id"] for e in snap["events"]], ["a", "c", "b"])
